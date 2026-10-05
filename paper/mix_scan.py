@@ -48,10 +48,14 @@ def pick(eq):
     return b
 
 
+FROM = "2025-10-06"
+import datetime as _dt
 def series(cap, use_method):
     eq, wp = cap, 0.0
     out = np.zeros(n)
-    for i in range(60, n):
+    _t0 = _dt.datetime.strptime(FROM, "%Y-%m-%d").replace(tzinfo=_dt.UTC).timestamp()*1000
+    _i0 = int(np.argmin(np.abs(T - _t0)))
+    for i in range(max(_i0, 60), n):
         if use_method:
             if C[i - 1] > ma[i - 1]:
                 _, tv, _ = pick(eq)
@@ -71,7 +75,7 @@ s_spot = series(1000, False)
 s_meth = series(1000, True)
 
 print("=" * 94)
-print(f"  配比扫描（{SYM}，{dt.datetime.fromtimestamp(T[60]/1000, dt.UTC):%Y-%m-%d}"
+print(f"  配比扫描（{SYM}，{dt.datetime.fromtimestamp(_dt.datetime.strptime(FROM, "%Y-%m-%d").replace(tzinfo=dt.UTC).timestamp()*1000/1000, dt.UTC):%Y-%m-%d}"
       f" ~ {dt.datetime.fromtimestamp(T[-1]/1000, dt.UTC):%Y-%m-%d}，本金 {CAP:.0f}U）")
 print("=" * 94)
 print()
@@ -80,7 +84,9 @@ print(f"  {'现货占比':>9}{'方法占比':>9}{'期末':>11}{'总收益':>11}"
 print("  " + "-" * 78)
 best = None
 for sp in np.arange(0, 1.01, 0.1):
-    x = (sp * s_spot + (1 - sp) * s_meth)[60:]
+    _t0 = _dt.datetime.strptime(FROM, "%Y-%m-%d").replace(tzinfo=_dt.UTC).timestamp()*1000
+    _i0 = int(np.argmin(np.abs(T - _t0)))
+    x = (sp * s_spot + (1 - sp) * s_meth)[_i0:]
     eq = np.cumprod(1 + x)
     dd = (eq / np.maximum.accumulate(eq) - 1).min()
     tot = eq[-1] - 1
