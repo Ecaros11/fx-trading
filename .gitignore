@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+
+# Node（依赖可由 pnpm-lock.yaml 完整重建，不该进仓库）
+node_modules/
+.pnpm-store/
+
+# 密钥文件 —— 绝对不能提交
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+credentials.json
+
+# 工具每次运行的输出（含账户余额），可随时重新生成
+data/reports/
+
+# 币安批量存档缓存（体积大，可重新下载）
+data/basis/
