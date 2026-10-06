@@ -766,6 +766,8 @@ def run(a):
                   f"  浮盈亏 {float(p['unRealizedProfit']):+,.3f}")
             if not pos:
                 A(f"  现有持仓     无")
+            # 供下面算「该买卖多少」用；空仓时为 0.0
+            held = sum(float(p["positionAmt"]) for p in pos)
             A("")
             adv = advice(eq, price, rvol)      # ← 唯一真源
             tgt_pos = adv["position"]
@@ -810,7 +812,30 @@ def run(a):
             tgt_n = adv["notional"]
             A(f"  目标名义 = {eq:,.2f} × {tgt_pos:.3f} = {tgt_n:,.2f} USDT")
             A(f"  目标数量 = {tgt_n:,.2f} ÷ {price:,.2f} = {adv['qty']:.4f} ETH")
-            A(f"  最小名义 = {MIN_NOTIONAL:.0f} USDT")
+            # ── 币安的下单约束：stepSize 0.001，且名义 ≥ MIN_NOTIONAL ──
+            _step = 0.001
+            _minq = max(_step, MIN_NOTIONAL / price)      # 实际最小可下单量
+            _minq = np.ceil(_minq / _step) * _step
+            _tgt_q = np.round(adv["qty"] / _step) * _step
+            A(f"  最小名义 = {MIN_NOTIONAL:.0f} USDT"
+              f"   ⇒ 最小下单 {_minq:.3f} ETH（步长 {_step}）")
+            A(f"  目标数量（按步长取整）= {_tgt_q:.3f} ETH"
+              f"   （原值 {adv['qty']:.4f}，差 {_tgt_q-adv['qty']:+.4f}）")
+            # 若读到持仓，直接给出该买卖多少
+            if held is not None:
+                _delta = _tgt_q - held
+                _dq = np.round(abs(_delta) / _step) * _step * (1 if _delta > 0 else -1)
+                A("")
+                if abs(_dq) < _minq - 1e-9:
+                    A(f"  现有持仓 {held:.3f} ETH   差额 {_delta:+.4f} ETH")
+                    A(f"  ✅ 差额 < 最小下单 {_minq:.3f} ⇒ 【不用动】")
+                else:
+                    A(f"  现有持仓 {held:.3f} ETH   差额 {_delta:+.4f} ETH")
+                    A(f"  ⇒ 【{'买入' if _dq > 0 else '卖出'} {abs(_dq):.3f} ETH】"
+                      f"（差额已取到 {_step} 的整数倍）")
+                    A(f"     下完单后持仓 = {held + _dq:.3f} ETH"
+                      f"（目标 {_tgt_q:.3f}，差 {held+_dq-_tgt_q:+.4f}）")
+            A("")
             if adv["fail"] == "below_min":
                 A(f"  ❌ 权益低于最低门槛，开不出单")
                 A(f"     最低门槛 {METHODS[0][2]:.2f} USDT"
@@ -838,6 +863,13 @@ def run(a):
                 A(f"   名义价值   {tgt_n:,.2f} USDT   ← 由仓位决定，与杠杆设置无关")
                 A(f"   杠杆设置   {lp['lev']}x          "
                   f"（= ceil({tgt_pos:.4f})，币安只允许整数）")
+                A(f"      ⚠️ 逐仓下杠杆【只能调高不能调低】—— 已有持仓时降不回去")
+                A(f"         · 首次设好之后不要每天改；只在工具说开不出来时才调高")
+                A(f"         · 若现在已经是更高杠杆，【保持不动即可】")
+                A(f"         · 杠杆比算出值更高不影响盈亏（盈亏由仓位决定），")
+                A(f"           只让强平更近 —— ≤{MAX_SAFE_LEV}x 都安全")
+                A(f"         · 反过来，杠杆低于仓位会【开不出来】"
+                  f"（保证金 = 名义 ÷ 杠杆 ≤ 权益）")
                 A(f"   保证金占用 {lp['margin']:,.2f} USDT   富余 {lp['spare']:,.2f} USDT")
                 A(f"   逐仓强平   标的 {lp['liq_iso_px']*100:>5.1f}%   "
                   f"账户 {lp['liq_iso_acc']*100:>6.1f}%")
