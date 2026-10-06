@@ -56,6 +56,25 @@ WORST_TRADE_CLOSE = -0.245    # 收盘口径 —— 仅供文档 §2.5 的对照
 #   lev ≤ 3  →  强平 ≥ 32.9%  >  26.6%  ✅
 #   lev = 4  →  强平   24.6%  <  26.6%  ❌ 会被强平
 MAX_SAFE_LEV = 3
+
+# ── 目标波动率的【主动覆盖】 ──
+# 默认 None = 自动：选「门槛 ≤ 权益」的最高档
+# ⚠️ 那个自动逻辑有个副作用：门槛是 20U ÷ 仓位 算出来的，
+#    所以权益越大 → 落到门槛越高的档 → 而门槛最高的档恰好是
+#    目标波动【最低】的 15% 档 ⇒ 赚到钱之后自动降杠杆。
+#    定投场景下尤其明显：权益一过 139.5U 就永久锁在 15%。
+#    用 --target-vol 40 可以强制锁定某一档。
+TARGET_VOL_OVERRIDE = None
+
+# ── 波动率目标版的「标称 vs 实际」口径 ──
+# 「目标波动率 25%」指的是【在场时】的目标（仓位 × 已实现波动 = 25%，恒等）。
+# 而账户整体波动只有目标的 89%，因为 45% 的时间空仓：
+#     空仓日拉低            −26%
+#     波动预测的倒数凸性     +13%   （E[1/σ̂] > 1/E[σ̂]）
+#     ─────────────────────────
+#     净                    −11%   →  89%
+# ⚠️ 改数据时必须重算（vol_formula.py 可复现）。
+VOL_ACHIEVE = 0.89
 # ⚠️ 币安只允许【整数】杠杆。所以"目标仓位 1.3486x"是设不了的 ——
 #    实际要设 ceil(仓位)。杠杆设置【不改变仓位】，只决定占用多少保证金和强平距离。
 
@@ -72,6 +91,15 @@ FEE_PER_SIDE = 0.0005
 # 注意两个数不是一回事：
 #   日线总根数 2505  →  减 60 根预热  →  回测样本 SAMPLE_DAYS = 2445 天
 #
+# ⚠️ 「目标波动率」是【在场时】的目标，不是账户整体波动：
+#       仓位 × 已实现波动 = 目标        ← 恒等式，精确成立（未触发 3x 上限时）
+#    而账户整体波动约为目标的 89%，因为 45% 的时间空仓。
+#    净 −11% 是两股力相抵的结果：
+#       空仓日（45% 时间）           −26%
+#       波动预测的倒数凸性偏差        +13%   （E[1/σ̂] > 1/E[σ̂]）
+#    ⇒ 所以「用 25% 档」实际承担约 22% 的账户波动。
+#      想拿真正的 25%，直接选 40% 档即可 —— 不需要改公式。
+#
 #   (名称,            目标波动率,  门槛本金, 历史夏普, 历史最大回撤)
 #
 # ⚠️ 夏普/回撤的口径（换手算时会漂，所以必须写明）：
@@ -79,7 +107,11 @@ FEE_PER_SIDE = 0.0005
 #   · 收益对齐 = w[t-1] × r[t]（昨天收盘决定，今天持有）—— 不是 w[t] × r[t]
 #   · 含成本   = 手续费 5bp/边 × |Δw|（系数 1！不是 2）+ 每日实际资金费
 #   · 数据     = ETHUSDT 永续，日线 2505 根；回测样本 2445 天 = 6.69 年（第 60 根起算）
-#   · 回撤     = 按【该版本自己的平均仓位】算出的复利净值最大回撤
+#   · 回撤     = 【每天对账到 min(3, 目标÷20日波动)】的复利净值最大回撤，
+#               含换手手续费与每日资金费。即实际执行路径的回撤，不是标称口径。
+#               40% 档在场平均仓位 0.6549（供核对）。
+#               ⚠️ 唯一真源是 align.py 的 panel()。
+#                  任何手写循环都要先和它逐点对比权重序列，否则会引入错位。
 #               固定版因杠杆随本金变，回撤用 dd_for_lev() 查表，不引用这里的数
 #
 # 🔴 2026-10-06 修正一：夏普那一列原来含【前视偏差】，已更正。
@@ -88,15 +120,15 @@ FEE_PER_SIDE = 0.0005
 #
 # 🔴 2026-10-06 修正二：align.py 的手续费原来是 `× 2`（多算一倍），已改为系数 1。
 #    ⇒ 夏普和回撤的口径都变了，本表随之更新：
-#         夏普 1.031 → 1.048（固定版）  1.217 → 1.245（波动率目标）
+#         夏普 1.031 → 1.047（固定版）  1.217 → 1.2442（波动率目标）
 #         回撤不变（-0.712 / -0.325 / -0.211 / -0.130 与系数 1 一致，原本就对）
 #    手续费系数的证明见 align.py 的 `lag()` 之后那段注释。
 #    ⚠️ 门槛【不受影响】（只依赖仓位分布，不涉及收益序列）—— 已复算确认。
 METHODS = [
-    ("固定版",          None,      14.2,   1.048, -0.712),
-    ("波动率目标 40%",    0.40,      52.3,   1.245, -0.325),
-    ("波动率目标 25%",    0.25,      83.7,   1.245, -0.211),
-    ("波动率目标 15%",    0.15,     139.5,   1.245, -0.130),
+    ("固定版",          None,      14.2,   1.047, -0.712),
+    ("波动率目标 40%",    0.40,      52.3,   1.2442, -0.325),
+    ("波动率目标 25%",    0.25,      83.7,   1.2442, -0.211),
+    ("波动率目标 15%",    0.15,     139.5,   1.2442, -0.130),
 ]
 
 # ── 固定版的回撤随杠杆变（同一策略，只缩放仓位，夏普不变但回撤变）──
@@ -168,8 +200,78 @@ def complete_bars(bars):
     return bars, f"最后一根已走完（{age/3600:.1f} 小时前收）"
 
 
+def fetch_all(bn):
+    """
+    从 API 拉【全量】日线。只用于缓存重建。
+    Binance 单次上限 1500 根，所以分页拉。
+    """
+    out, start = [], 1567900800000          # 2019-09-08
+    while True:
+        k = bn.fapi("/fapi/v1/klines",
+                    {"symbol": SYM, "interval": "1d",
+                     "startTime": start, "limit": 1500}, signed=False)
+        if not k:
+            break
+        for x in k:
+            out.append({"t": int(x[0]), "o": float(x[1]), "h": float(x[2]),
+                        "l": float(x[3]), "c": float(x[4]), "v": float(x[5])})
+        if len(k) < 1500:
+            break
+        start = int(k[-1][0]) + 86400000
+    return out
+
+
+def load_cache(bn, rebuild=False):
+    """
+    安全读缓存。
+
+    ⚠️ 这里原来在 try 之外直接 json.loads(CACHE.read_text())，导致缓存一旦
+       损坏（文件不存在 / 空文件 / 非法 JSON / 空数组 / null）就抛
+       FileNotFoundError / JSONDecodeError / IndexError / TypeError，
+       而 CACHE 是【唯一】数据存储、七个参数里没有重建命令
+       ⇒ 工具会永久不可用，且报错不指向根因。
+
+    现在：任何损坏都自动走【全量重建】，并打印原因。
+    """
+    reason = None
+    if not rebuild:
+        try:
+            old = json.loads(CACHE.read_text(encoding="utf-8"))
+            if not isinstance(old, list):
+                reason = f"顶层不是数组（{type(old).__name__}）"
+            elif not old:
+                reason = "空数组"
+            elif not all(isinstance(r, dict) and "t" in r and "c" in r for r in old):
+                reason = "缺少 t/c 字段"
+            else:
+                return old
+        except FileNotFoundError:
+            reason = "文件不存在"
+        except json.JSONDecodeError as e:
+            reason = f"JSON 非法（{e.msg}）"
+        except OSError as e:
+            reason = f"读不了（{e.strerror}）"
+        except Exception as e:
+            reason = type(e).__name__
+        print(f"  ⚠️ 缓存不可用（{reason}）—— 从 API 全量重建…")
+    else:
+        print("  --rebuild：从 API 全量重建缓存…")
+
+    old = fetch_all(bn)
+    if not old:
+        raise RuntimeError("API 没有返回任何 K 线 —— 检查网络 / 代理 / SYM")
+    old.sort(key=lambda r: r["t"])
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(old), encoding="utf-8")
+    print(f"  ✅ 缓存已重建：{len(old)} 根"
+          f"（{dt.datetime.fromtimestamp(old[0]['t']/1000, dt.UTC):%Y-%m-%d} ~ "
+          f"{dt.datetime.fromtimestamp(old[-1]['t']/1000, dt.UTC):%Y-%m-%d}）")
+    return old
+
+
 def refresh(bn):
     """回看最后 5 根，修正可能未走完时写入的值（和 eth_signal 同一个修法）"""
+    old = load_cache(bn)
     old = json.loads(CACHE.read_text(encoding="utf-8"))
     idx = {int(r["t"]): i for i, r in enumerate(old)}
     last = int(old[-1]["t"])
@@ -245,8 +347,20 @@ def pick_method(equity):
     """
     按本金选出能执行的最好版本。
 
+    ⚠️ 若 TARGET_VOL_OVERRIDE 已设（--target-vol），则强制用那一档，
+       不再按「门槛 ≤ 权益」自动选。原因：门槛 = 20U ÷ 仓位，
+       所以权益越大 → 落到门槛越高的档 → 而门槛最高的档恰好是
+       目标波动最低的 15% 档 ⇒ 赚到钱之后自动降杠杆（定投时尤其明显）。
+
     返回 (名称, 目标波动率, 门槛, 夏普, 回撤, 下一档, 距离下一档还差多少)
     """
+    # ── --target-vol 强制覆盖 ──
+    if TARGET_VOL_OVERRIDE is not None:
+        # 门槛取【最接近的那一档】—— 用于提示"权益够不够开出最小单"
+        _c = [m for m in METHODS if m[1] is not None]
+        _b = min(_c, key=lambda m: abs(m[1] - TARGET_VOL_OVERRIDE))
+        return (f"波动率目标 {TARGET_VOL_OVERRIDE*100:g}%",
+                TARGET_VOL_OVERRIDE, _b[2], _b[3], _b[4], None, _b[2] - equity)
     # 连最低门槛都没到 —— 下一档就是第 1 档，不是"已是最高"
     if equity < METHODS[0][2]:
         return METHODS[0] + (METHODS[0], METHODS[0][2] - equity)
@@ -341,6 +455,9 @@ def dynamic_drawdown(bars, fund_by_day, start_equity):
             "switches": len(switches), "switch_log": switches}
 
 
+# ⚠️ bars 必须是【字典列表】（[{"c":...}]），不是 numpy 数组。
+#    传数组会报 IndexError: invalid index to scalar variable —— 不指向根因。
+#    要传数组请用 realized_vol_from_prices()（若有）。
 def realized_vol(bars, win=20):
     """过去 win 根【已走完】日线的年化波动率。用于波动率目标版。"""
     c = np.array([b["c"] for b in bars], float)
@@ -421,6 +538,7 @@ def advice(equity, price, rvol=None):
     返回一个 dict，含所有中间量，供显示和归档共用。
     """
     mname, tv, mneed, msr, mdd_tab, nxt, gap = pick_method(equity)
+    forced = TARGET_VOL_OVERRIDE is not None
     pos = target_position(equity, rvol, (mname, tv, mneed, msr, mdd_tab))
     # 低于该版本的最低门槛 → 无论算出什么仓位都开不出来
 
@@ -614,6 +732,11 @@ def run(a):
 
     # ── 执行建议 ──
     eq = None
+    # ⚠️ realized_vol 的注释说「截至第 i-1 根收盘」—— 那是对 weight[i] 正确。
+    #    但 net[i] = lag(w)[i] × r[i] = w[i-1] × r[i]，
+    #    而 w[i-1] 用的是 vol20[i-1] = r[i-21:i-1].std()，
+    #    即【截至第 i-2 根收盘】的窗口。差一天，容易被误读成滚动一天。
+    #    （这个歧义曾让一份外部复核多滞后一天，得到 −41.3% 而非 −32.5%。）
     rvol = realized_vol(bars)          # 供波动率目标版用（无前视：只用已走完的）
     # 兜底默认值。读账户失败时 eq 为 None，归档里的建议字段是空的，
     # 所以这些默认值只影响 decide_action 的判断，不影响下单量。
@@ -653,7 +776,17 @@ def run(a):
             if rvol is not None and np.isfinite(rvol):
                 A(f"  20 日已实现波动   {rvol*100:.1f}%  （波动率目标版要用）")
                 A("")
-            A(f"  账户权益 {eq:,.2f} USDT  ⇒  匹配版本：**{adv['method']}**")
+            _tag = "（--target-vol 强制）" if TARGET_VOL_OVERRIDE is not None else ""
+            A(f"  账户权益 {eq:,.2f} USDT  ⇒  匹配版本：**{adv['method']}**{_tag}")
+            if TARGET_VOL_OVERRIDE is not None and eq < adv["threshold"]:
+                A(f"     ⚠️ 但权益 {eq:,.2f}U < 该档门槛 {adv['threshold']:.1f}U"
+                  f"（差 {adv['threshold']-eq:,.2f}U）")
+                A(f"        ⇒ 该档在低波动时会算不出最小单，可能需要在"
+                  f"「目标数量」为 0 时手动跳过")
+            if adv["target_vol"] is not None:
+                A(f"     （目标波动率是【在场时】的；账户整体约 "
+                  f"{adv['target_vol']*VOL_ACHIEVE*100:.0f}%"
+                  f" —— 因为约 45% 时间空仓）")
             A(f"     门槛阶梯：" + "  ".join(
                 f"{mm[0]}≥{mm[2]:.1f}U" for mm in METHODS))
             if eq < METHODS[0][2]:
@@ -839,7 +972,8 @@ def backfill():
     if not rows:
         print("  还没有归档。先跑 python ma50_live.py --archive")
         return
-    bars = json.loads(CACHE.read_text(encoding="utf-8"))
+    from binance_api import BN as _BN      # 模块级不导入，这里按需取
+    bars = load_cache(_BN())               # 与 refresh 同一个安全入口
     bars, _ = complete_bars(bars)
     c = {int(b["t"]): i for i, b in enumerate(bars)}
     filled = partial = failed = pending = 0
@@ -999,12 +1133,18 @@ def selfcheck():
         x = x[np.isfinite(x)]
         r_sh, r_dd = sharpe(x), max_dd(x)
         d_sh, d_dd = r_sh - t_sh, r_dd - t_dd
-        flag = "" if (abs(d_sh) < 0.005 and abs(d_dd) < 0.010) else "  ⚠️"
+        # ⚠️ 2026-10-06：容差从 ±0.005 收紧到 ±0.001。
+        #    原来 1.245 与真值 1.2442 差 0.0018，旧容差放过了它。
+        # ⚠️ 容差 ±0.003：METHODS 表是【快照】，而数据每天在长，
+        #    夏普会随之漂移（实测约 0.001/天）。
+        #    故意放到 ±0.003（约 3 天漂移）——
+        #    真出错时偏差会是 0.01+ 量级，不会被漏掉。
+        flag = "" if (abs(d_sh) < 0.003 and abs(d_dd) < 0.005) else "  ⚠️"
         if flag:
             bad += 1
         print(f"     {name:<18}{t_sh:>10.3f}{r_sh:>9.3f}{d_sh:>+8.3f}"
               f"{t_dd*100:>9.1f}%{r_dd*100:>8.1f}%{d_dd*100:>+7.1f}pp{flag}")
-    print("     │ 容差：夏普 ±0.005，回撤 ±1.0pp")
+    print("     │ 容差：夏普 ±0.003，回撤 ±0.5pp（数据日增会漂移，约 0.001/天）")
     print("     │ ✅ 2026-10-06 起两列都是 0.0 差 —— 系数 1 口径下完全对齐")
 
     # ③ 门槛核对
@@ -1108,8 +1248,29 @@ def main():
     ap.add_argument("--backfill", action="store_true")
     ap.add_argument("--selfcheck", action="store_true",
                     help="核对 METHODS/DD_BY_LEV 表和实算是否一致 + 对齐自检")
+    ap.add_argument("--rebuild", action="store_true",
+                    help="从 API 全量重建日线缓存（缓存损坏时自动触发，也可手动跑）")
+    ap.add_argument("--target-vol", type=float, default=None, metavar="N",
+                    help="强制目标波动率档位（15/25/40），不填=按权益自动选"
+                         "（权益越大自动越保守，定投时会被锁死在 15%%）")
     a = ap.parse_args()
 
+    if a.rebuild:
+        from binance_api import BN as _BN
+        load_cache(_BN(), rebuild=True)
+        return
+    global TARGET_VOL_OVERRIDE
+    if a.target_vol is not None:
+        v = a.target_vol / 100.0 if a.target_vol > 1 else a.target_vol
+        # ⚠️ 原来只在 METHODS 里精确匹配，等于人为限制成 15/25/40 三档。
+        #    实测 15%~60% 的夏普完全恒定（极差 0.0000），所以任何值都等价。
+        #    门槛按【最接近的档位】取（用于提示"权益够不够开单"）。
+        if not (0.05 <= v <= 0.60):
+            print(f"  🔴 目标波动率应在 5%~60% 之间（给的是 "
+                  f"{a.target_vol}%）。超过 60% 会触发 3x 上限截断，"
+                  f"夏普反而下降。")
+            return
+        TARGET_VOL_OVERRIDE = v
     if a.history:
         history(); return
     if a.backfill:

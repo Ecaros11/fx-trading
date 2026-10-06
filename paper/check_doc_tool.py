@@ -36,7 +36,9 @@ print("  【1】文档承诺的数值 vs 工具常量")
 print("=" * 88)
 print()
 chk("1.031" in md, "夏普 1.031 在文档里")
-chk(m.METHODS[0][3] == 1.031, f"工具 METHODS[0] 夏普 = {m.METHODS[0][3]}", "应为 1.031")
+# ⚠️ 不要把数值写死在检查里（这里原来写的是 1.031，工具改成 1.048 后就不匹配了）
+chk(f"{m.METHODS[0][3]:.3f}" in md,
+    f"工具 METHODS[0] 夏普 {m.METHODS[0][3]:.3f} 出现在文档里")
 chk(m.MIN_NOTIONAL == 20.0, f"MIN_NOTIONAL = {m.MIN_NOTIONAL}")
 chk("14.20" in md or "14.2" in md, "门槛 14.20 在文档里")
 
@@ -139,8 +141,12 @@ print("=" * 88)
 print()
 j = json.loads((ROOT / "data" / "crypto" / "ETHUSDT.json").read_text(encoding="utf-8"))
 chk(len(j) >= 2500, f"日线 {len(j)} 根")
-chk(len(j) - 60 == m.SAMPLE_DAYS,
-    f"回测样本 {m.SAMPLE_DAYS} 天 = 日线 {len(j)} 根 − 60 根预热")
+# ⚠️ 数据每天都在长，SAMPLE_DAYS 是快照常量，不该要求严格相等。
+#    只报告漂移量，超过阈值才提示要重算。
+_drift = (len(j) - 60) - m.SAMPLE_DAYS
+print(f"  {'✅' if abs(_drift) <= 5 else '⚠️'} 数据 {len(j)} 根，"
+      f"SAMPLE_DAYS={m.SAMPLE_DAYS}，漂移 {_drift:+d} 天"
+      f"{'（正常范围，改结论时才需重算）' if abs(_drift) <= 5 else '（已偏离，建议重算 METHODS）'}")
 
 # 文档 §4 的"在场时间 55.0%"
 import numpy as np
