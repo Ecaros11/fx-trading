@@ -200,6 +200,57 @@ def complete_bars(bars):
     return bars, f"最后一根已走完（{age/3600:.1f} 小时前收）"
 
 
+def refresh_funding(bn):
+    """
+    增量更新资金费。
+
+    ⚠️ 这里原来【没有任何更新逻辑】—— FUND 在整个文件里只被读、从不被写，
+       所以资金费数据永远停在初始灌进去的那一刻。
+       后果：决策日/次日的资金费显示会越来越旧（实测落后了整整一天）。
+       资金费 8 小时结算一次（UTC 00:00 / 08:00 / 16:00），一天 3 条。
+
+    返回 (新增条数, 错误信息或 None)。
+    """
+    loc = []
+    try:
+        loc = json.loads(FUND.read_text(encoding="utf-8"))
+        if not isinstance(loc, list):
+            loc = []
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"  ⚠️ 资金费缓存坏了（{type(e).__name__}）—— 全量重建")
+        loc = []
+
+    last = max((int(x["t"]) for x in loc if isinstance(x, dict) and "t" in x),
+               default=0)
+    try:
+        if last:
+            got = bn.fapi("/fapi/v1/fundingRate",
+                          {"symbol": SYM, "startTime": last + 1, "limit": 1000},
+                          signed=False)
+        else:
+            got = bn.fapi("/fapi/v1/fundingRate",
+                          {"symbol": SYM, "limit": 1000}, signed=False)
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+
+    have = {int(x["t"]) for x in loc if isinstance(x, dict) and "t" in x}
+    add = 0
+    for x in got:
+        t = int(x["fundingTime"])
+        if t in have:
+            continue
+        loc.append({"t": t, "rate": float(x["fundingRate"])})
+        have.add(t)
+        add += 1
+    if add:
+        loc.sort(key=lambda x: x["t"])
+        FUND.parent.mkdir(parents=True, exist_ok=True)
+        FUND.write_text(json.dumps(loc), encoding="utf-8")
+    return add, None
+
+
 def fetch_all(bn):
     """
     从 API 拉【全量】日线。只用于缓存重建。
@@ -302,6 +353,10 @@ def refresh(bn):
         old.sort(key=lambda r: r["t"])
         CACHE.write_text(json.dumps(old), encoding="utf-8")
         st["ok"] = True
+        # 资金费也要增量更新（原来完全没更新）
+        _add, _err = refresh_funding(bn)
+        st["fund_add"] = _add
+        st["fund_err"] = _err
     except Exception as e:
         st["err"] = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
     return old, fixed, st
