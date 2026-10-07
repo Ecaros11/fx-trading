@@ -148,10 +148,10 @@ FEE_PER_SIDE = 0.0005
 #        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │
 #        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤
 #        │  固定版   │  14.2U │ 1.0460 │   83.8%  │   67.4%  │ -71.2% │  31.6x │
-#        │  60%   │  31.8U │ 1.3411 │   83.2%  │   92.4%  │ -52.5% │  80.3x │
-#        │  40%   │  47.7U │ 1.3457 │   56.2%  │   61.6%  │ -37.7% │  24.9x │
-#        │  25%   │  76.3U │ 1.3446 │   35.1%  │   37.5%  │ -24.8% │   8.4x │
-#        │  15%   │ 127.1U │ 1.3446 │   21.1%  │   22.0%  │ -15.4% │   3.8x │
+#        │  60%   │  31.7U │ 1.2875 │   79.6%  │   86.2%  │ -54.3% │  64.4x │
+#        │  40%   │  47.5U │ 1.2878 │   54.1%  │   58.2%  │ -39.4% │  21.6x │
+#        │  25%   │  76.1U │ 1.2895 │   33.9%  │   35.8%  │ -26.1% │   7.8x │
+#        │  15%   │ 126.8U │ 1.2895 │   20.3%  │   21.1%  │ -16.3% │   3.6x │
 #        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘
 #    同期 ETH 买入持有：算数 74.9%  几何 51.0%
 #
@@ -168,10 +168,10 @@ METHODS_ASOF = "2026-10-07"
 
 METHODS = [
     ("固定版",             None,      14.2,     1.0460, -0.712),
-    ("波动率目标 60%",       0.6,       31.8,     1.3411, -0.525),
-    ("波动率目标 40%",       0.4,       47.7,     1.3457, -0.377),
-    ("波动率目标 25%",       0.25,      76.3,     1.3446, -0.248),
-    ("波动率目标 15%",       0.15,      127.1,    1.3446, -0.154),
+    ("波动率目标 60%",       0.6,       31.7,     1.2875, -0.543),
+    ("波动率目标 40%",       0.4,       47.5,     1.2878, -0.394),
+    ("波动率目标 25%",       0.25,      76.1,     1.2895, -0.261),
+    ("波动率目标 15%",       0.15,      126.8,    1.2895, -0.163),
 ]
 
 # ── 固定版的回撤随杠杆变（同一策略，只缩放仓位，夏普不变但回撤变）──
@@ -627,6 +627,47 @@ def realized_vol(bars, win=None):
     return float(r.std(ddof=1) * np.sqrt(365))
 
 
+# ══════════════════ 保证金可行性（2026-10-07 审计）══════════════════
+# 逐仓下"能不能开出来"的判据（权益被消掉，只取决于 w）：
+#     (权益·w)/ceil(w) + 权益·w·FEE ≤ 权益
+#     ⟺  w/ceil(w) + w·FEE ≤ 1
+#
+# ⚠️ 坏区间：w ∈ (n/(1+n·FEE), n]（n = ceil(w) 为整数）
+#    n=1: (0.999500, 1]   n=2: (1.998002, 2]   n=3: (2.995507, 3]
+# 实测 60% 档有 19 天落在 w = 3.000000（被 3x 上限截断），1 天在 w≈0.9999
+# ⇒ 顶格时逐仓保证金 = 名义/n = 权益×100%，连手续费都付不起
+#
+# ⚠️ 全仓不受此限：保证金只需 名义×MMR ≈ 1.2%，且强平价与逐仓几乎相同
+#    （逐仓 1/L−MMR = 32.93% vs 全仓 (1/w−MMR)/(1−MMR) = 33.07%）
+MAX_LEV_SET = 3                      # 逐仓整数杠杆上限
+
+
+def max_pos_for(nlev, fee=None):
+    """
+    整数杠杆 nlev 下【能真正开出来】的最大仓位。
+    w/n + w·fee ≤ 1  ⟺  w ≤ n/(1 + n·fee)
+    """
+    f = FEE_PER_SIDE if fee is None else fee
+    return nlev / (1.0 + nlev * f)
+
+
+MAX_POS = max_pos_for(MAX_LEV_SET)   # ≈ 2.995507
+
+
+def feasible_pos(w, fee=None):
+    """
+    把 w 向下调整到 w/ceil(w) + w·fee ≤ 1 的最小改动版。
+    返回调整后的 w（若本来就可行则原样返回）。
+    """
+    f = FEE_PER_SIDE if fee is None else fee
+    if w is None or w <= 0:
+        return 0.0
+    n_ = max(1, int(np.ceil(w - 1e-9)))
+    if w / n_ + w * f <= 1.0:
+        return w
+    return n_ / (1.0 + n_ * f) * 0.999      # 留 0.1% 余量
+
+
 def target_position(equity, rvol, method):
     """
     返回目标仓位（占权益倍数）。method = (名称, 目标波动率, 门槛, ...)
@@ -638,6 +679,8 @@ def target_position(equity, rvol, method):
        实测（2019-11 ~ 2026-10，10日窗口 + 60%档 + 3x 逐仓）：
            无上限：强平 2 次，最坏逆向 −58.5%，年化 81.4%，夏普 1.234
            上限120%：强平 0 次，最坏逆向 −27.0%，年化 89.8%，夏普 1.321
+       ⚠️ 这组是【独立强平模拟】口径（允许仓位突破上限），
+          不等于主表的 align.panel 口径（60% 档：夏普 1.2875、几何 86.2%）。
        ⇒ 避开的是 2021-05-19（当日 10日波动 124.2%，持仓盘中 −58.5%）
        ⇒ 有效区间很宽：90% ~ 130% 都能做到 0 次强平（不是单点拟合）
     """
@@ -653,7 +696,8 @@ def target_position(equity, rvol, method):
         return 0.0
     if VOL_CAP is not None and rvol > VOL_CAP:
         return 0.0                     # 波动率过高 ⇒ 空仓
-    return float(min(3.0, tv / rvol))
+    # ⚠️ 用 MAX_POS 而不是硬编码 3.0 —— 顶格时逐仓开不出来（见上）
+    return float(min(MAX_POS, tv / rvol))
 
 
 def leverage_plan(equity, position, notional):
@@ -737,7 +781,24 @@ def advice(equity, price, rvol=None):
     elif equity * pos < MIN_NOTIONAL:
         fail = "notional"
     else:
+        # ⚠️ 2026-10-07 审计：#2 保证金可行性
+        #    逐仓：保证金 = 名义/ceil(w)，加手续费可能超过权益
+        #    ⇒ 判据 w/ceil(w) + w·FEE ≤ 1（与权益无关！）
+        #    实测 60% 档有 20 天触发（19 天是 w=3.0 顶格）
         fail = None
+        if pos > 0:
+            _n_lev = int(np.ceil(pos - 1e-9))
+            _lhs = pos / _n_lev + pos * FEE_PER_SIDE
+            # ⚠️ MAX_POS 下 _lhs 恰好 = 1.0（临界），加容差防浮点抖动
+            if _lhs > 1.0 + 1e-9:
+                fail = "margin"
+    _margin_note = None
+    if fail == "margin":
+        _margin_note = (
+            f"逐仓开不出来：保证金 {pos/np.ceil(pos-1e-9)*100:.2f}% 权益"
+            f" + 手续费 {pos*FEE_PER_SIDE*100:.3f}% > 100%"
+            f"；可改【全仓】（保证金仅需 {pos*MMR*100:.2f}%，"
+            f"强平距离几乎相同）")
 
     notional = equity * pos
     # 固定版的回撤随【实际杠杆】变；波动率目标版用表里的数
@@ -752,6 +813,9 @@ def advice(equity, price, rvol=None):
         "feasible": fail is None, "fail": fail,
         "need_equity": (MIN_NOTIONAL / pos) if pos > 0 else float("inf"),
         "worst": equity * (1 + dd),
+        "margin_note": _margin_note,
+        "feasible_pos": feasible_pos(pos),
+        "max_ok_pos": max_pos_for(int(np.ceil(max(pos, 1e-9)))),
     }
 
 
@@ -1051,7 +1115,7 @@ def run(a):
                   f"（还差 {adv['gap']:,.2f} U）—— 夏普 {nx[3]:.3f}，回撤 {nx[4]*100:.1f}%")
             else:
                 # ⚠️ 2026-10-07：V2 默认锁 60% 档，而 60% 是【风险最高】的一档
-                #    （回撤 −52.5%），不是"回撤最小"。原文案在强制档位下误导。
+                #    （回撤 −54.3%），不是"回撤最小"。原文案在强制档位下误导。
                 if TARGET_VOL_OVERRIDE is not None:
                     _m = [x for x in METHODS
                           if x[1] == TARGET_VOL_OVERRIDE] or [METHODS[1]]

@@ -61,25 +61,31 @@ print("  ── 模拟：API 通，但不返回新 K 线（缓存停在旧日期
 import json
 import datetime as dt
 CACHE = m.CACHE
+# ⚠️ 2026-10-07 审计修复：原来 write_text(orig) 在末尾恢复，没有 try/finally
+#    ⇒ 中途异常/被中断就会把【截断后的缓存】留在生产文件里。
+#    现在用 try/finally 保证无论如何都还原；SIGKILL 仍无解，
+#    但那种情况可用 `ma50_live.py --rebuild` 恢复。
 orig = CACHE.read_text(encoding="utf-8")
-j = json.loads(orig)
-cut = j[:-40]                      # 砍掉 40 天
-CACHE.write_text(json.dumps(cut), encoding="utf-8")
-last = dt.datetime.fromtimestamp(cut[-1]["t"] / 1000, dt.UTC)
-print(f"     缓存最后一根 {last:%Y-%m-%d}")
-fake = FakeBN(None)                # 不抛异常，但返回空列表
-bars, fixed, st = m.refresh(fake)
-bars2, note = m.complete_bars(bars)
-age = (dt.datetime.now(dt.UTC)
-       - dt.datetime.fromtimestamp(bars2[-1]["t"] / 1000, dt.UTC)).total_seconds() / 3600
-print(f"     refresh 后 st['ok'] = {st['ok']}  （API 没抛异常，所以为 True）")
-print(f"     缓存仍停在 {dt.datetime.fromtimestamp(bars2[-1]['t']/1000, dt.UTC):%Y-%m-%d}"
-      f"，age = {age:.0f} 小时")
-print(f"     ⇒ 48h guard {'会拦截 ✅' if age > 48 else '不拦截 ❌'}")
-
-CACHE.write_text(orig, encoding="utf-8")
-print()
-print("     （缓存已还原）")
+try:
+    j = json.loads(orig)
+    cut = j[:-40]                      # 砍掉 40 天
+    CACHE.write_text(json.dumps(cut), encoding="utf-8")
+    last = dt.datetime.fromtimestamp(cut[-1]["t"] / 1000, dt.UTC)
+    print(f"     缓存最后一根 {last:%Y-%m-%d}")
+    fake = FakeBN(None)                # 不抛异常，但返回空列表
+    bars, fixed, st = m.refresh(fake)
+    bars2, note = m.complete_bars(bars)
+    age = (dt.datetime.now(dt.UTC)
+           - dt.datetime.fromtimestamp(bars2[-1]["t"] / 1000, dt.UTC)).total_seconds() / 3600
+    print(f"     refresh 后 st['ok'] = {st['ok']}  （API 没抛异常，所以为 True）")
+    print(f"     缓存仍停在 {dt.datetime.fromtimestamp(bars2[-1]['t']/1000, dt.UTC):%Y-%m-%d}"
+          f"，age = {age:.0f} 小时")
+    print(f"     ⇒ 48h guard {'会拦截 ✅' if age > 48 else '不拦截 ❌'}")
+finally:
+    # 无论正常/异常/无消息异常，都还原
+    CACHE.write_text(orig, encoding="utf-8")
+    print()
+    print("     （缓存已还原）")
 
 print()
 print("=" * 76)
