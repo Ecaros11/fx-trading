@@ -21,6 +21,11 @@ _spec = importlib.util.spec_from_file_location("ml", HERE / "ma50_live.py")
 ml = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ml)
 
+# ⚠️ 仓位上限必须从工具读 —— 硬编码 3.0 会让门槛检验与工具不一致
+#    （顶格时逐仓保证金 = 100% 权益 + 手续费 > 权益 ⇒ 开不出来，
+#      所以工具用的是 MAX_POS = n/(1+n·FEE) ≈ 2.995507）
+MAXPOS = ml.MAX_POS
+
 bars = json.loads((ROOT / "data" / "crypto" / f"{ml.SYM}.json").read_text(encoding="utf-8"))
 
 print("=" * 88)
@@ -43,7 +48,7 @@ for tv in (0.60, 0.40, 0.25, 0.15):
             continue
         if ml.VOL_CAP is not None and rv > ml.VOL_CAP:
             continue
-        ws.append(min(3.0, tv / rv))
+        ws.append(min(MAXPOS, tv / rv))
     DIST[tv] = np.array(ws)
 
 print(f"  {'版本':<18}{'门槛(工具)':>12}{'第10分位仓位':>15}{'20÷p10':>10}"

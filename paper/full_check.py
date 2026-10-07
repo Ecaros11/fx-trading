@@ -124,7 +124,7 @@ def ser(lookahead):
     out, wp = [], 0.0
     for i in range(61, len(C)):
         j = i if lookahead else i - 1
-        w = (min(3.0, 0.60 / V[j])
+        w = (min(m.MAX_POS, 0.60 / V[j])
              if (sig[j] and np.isfinite(V[j]) and 0 < V[j] <= m.VOL_CAP)
              else 0.0)
         out.append(w * r[i] - abs(w - wp) * 0.0005)

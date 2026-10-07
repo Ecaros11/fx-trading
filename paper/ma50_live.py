@@ -123,7 +123,7 @@ FEE_PER_SIDE = 0.0005
 #   · 收益对齐 = w[t-1] × r[t]（昨天收盘决定，今天持有）—— 不是 w[t] × r[t]
 #   · 含成本   = 手续费 5bp/边 × |Δw|（系数 1！不是 2）+ 每日实际资金费
 #   · 数据     = ETHUSDT 永续日线；回测样本见 SAMPLE_DAYS / SAMPLE_YEARS（第 60 根起算）
-#   · 回撤     = 【每天对账到 min(3, 目标÷20日波动)】的复利净值最大回撤，
+#   · 回撤     = 【每天对账到 min(MAX_POS, 目标÷10日波动)】的复利净值最大回撤，
 #               含换手手续费与每日资金费。即实际执行路径的回撤，不是标称口径。
 #               40% 档在场平均仓位 0.6549（供核对）。
 #               ⚠️ 唯一真源是 align.py 的 panel()。
@@ -575,7 +575,8 @@ def dynamic_drawdown(bars, fund_by_day, start_equity):
         v = vol[i]
         if not np.isfinite(v) or v <= 0:
             return 0.0, mname
-        return min(3.0, tv / v), mname
+        # ⚠️ 用 MAX_POS 而不是硬编码 3.0 —— 与 target_position 保持一致
+        return min(MAX_POS, tv / v), mname
 
     eq = start_equity
     peak = eq
@@ -672,7 +673,7 @@ def target_position(equity, rvol, method):
     """
     返回目标仓位（占权益倍数）。method = (名称, 目标波动率, 门槛, ...)
     · 固定版：max(1.0, 20/权益) —— 不是常量
-    · 波动率目标版：min(3, target_vol / 已实现波动)
+    · 波动率目标版：min(MAX_POS, target_vol / 已实现波动)
 
     ⚠️ V2 新增：波动率上限 VOL_CAP
        已实现波动 > VOL_CAP 时【强制空仓】。
@@ -1134,7 +1135,7 @@ def run(a):
                 A(f"     （固定版：权益 < {MIN_NOTIONAL:.0f}U 时被迫超过满仓，"
                   f">= {MIN_NOTIONAL:.0f}U 后回到 1.0x）")
             else:
-                A(f"  目标仓位 = min(3, {adv['target_vol']*100:.0f}% ÷ "
+                A(f"  目标仓位 = min({MAX_POS:.4f}, {adv['target_vol']*100:.0f}% ÷ "
                   f"{rvol*100:.1f}%) = {tgt_pos:.3f}x")
             tgt_n = adv["notional"]
             A(f"  目标名义 = {eq:,.2f} × {tgt_pos:.3f} = {tgt_n:,.2f} USDT")
