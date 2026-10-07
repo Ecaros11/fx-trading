@@ -14,11 +14,15 @@ MA50 固定仓位 · 可执行工具（ma50_live.py）
 
 ⚠️ 只做多。仓位【不是常量】——它按本金自动匹配版本：
 
-     权益 < 14.20U        →  开不出单（最小名义 20U 都下不了）
-     14.20 ~ 52.3U        →  固定版：仓位 = max(1.0, 20 ÷ 权益)
-     52.3 ~ 83.7U         →  波动率目标 40%
-     83.7 ~ 139.5U        →  波动率目标 25%
-     ≥ 139.5U             →  波动率目标 15%
+     ⚠️ V2 默认锁定 60% 档，不自动升档。
+        下面的阶梯只在你用 --target-vol 切档时才生效：
+
+     权益 < 14.2U          →  开不出单（最小名义 20U 都下不了）
+     14.2 ~ 31.7U         →  固定版：仓位 = max(1.0, 20 ÷ 权益)
+     31.7 ~ 47.5U         →  波动率目标 40%（默认 60% 需 ≥ 31.7U）
+     47.5 ~ 76.1U         →  波动率目标 25%
+     76.1 ~ 126.8U        →  波动率目标 15%
+     ≥ 126.8U             →  全部档位可用
 
    门槛 = 最小名义 20U ÷ 【有仓位日的第 10 分位仓位】（见 METHODS 表）。
    工具每次运行都读账户重算，不需要手动改参数。
@@ -37,6 +41,18 @@ sys.path.insert(0, str(ROOT))
 
 SYM = "ETHUSDT"
 MA_WINDOW = 50
+
+# ══════════════════════════════════════════════════════════════════════
+#  V2：与 V1 的唯一区别就在这两行
+#    · 波动率窗口 20 → 10   （实测年化优势 +11.7pp，HAC t≈2.04）
+#    · 默认目标波动 40% → 60%（实测收益 2.2 倍，最差回撤 −17% → −29%）
+#  ⚠️ V1 和 V2 并行运行，互不影响：
+#     归档文件不同、报告目录不同，但共用同一份日线/资金费缓存。
+# ══════════════════════════════════════════════════════════════════════
+VOL_WINDOW = 10                # ← V1 是 20
+DEFAULT_TARGET_VOL = 0.60      # ← V1 是「按权益自动选」，这里默认锁 60%
+VOL_CAP = 1.20                 # 已实现波动 > 120% ⇒ 强制空仓（防强平）
+                               #   None = 关闭该保护
 # ⚠️ 这个常量【不再用于计算】。固定版的仓位由 fixed_position() 按权益算
 #    （max(1.0, 20/权益)）。1.405 只是"20 ÷ 14.23"这个历史值的残留，
 #    现在仅作读账户失败时的兜底默认值。
@@ -80,8 +96,8 @@ VOL_ACHIEVE = 0.89
 
 # ── 样本量与不确定性（改数据时必须同步重算，文档 §5.1/§8 引用同一组数）──
 SE_SHARPE = 0.387            # 年化夏普的标准误 = sqrt((1+S_d^2/2)/n)·sqrt(365)
-SAMPLE_YEARS = 6.69          # 回测年数（第 60 根起算）
-SAMPLE_DAYS = 2445           # 回测天数
+SAMPLE_YEARS = 6.70          # 回测年数（第 60 根起算）
+SAMPLE_DAYS = 2447           # 回测天数
 FEE_PER_SIDE = 0.0005
 
 # ── 按本金匹配版本 ──
@@ -123,12 +139,31 @@ FEE_PER_SIDE = 0.0005
 #         夏普 1.031 → 1.047（固定版）  1.217 → 1.2442（波动率目标）
 #         回撤不变（-0.712 / -0.325 / -0.211 / -0.130 与系数 1 一致，原本就对）
 #    手续费系数的证明见 align.py 的 `lag()` 之后那段注释。
-#    ⚠️ 门槛【不受影响】（只依赖仓位分布，不涉及收益序列）—— 已复算确认。
+#
+# ══════════════════════════════════════════════════════════════════════
+#  V2 的 METHODS（10 日窗口 + 波动率上限 120% + 60% 档为默认）
+#    门槛 = 20U ÷ 有仓位日第 10 分位仓位   （与 V1 同一算法）
+#    实算（2019-11 ~ 2026-10，在场 1256 天，含手续费与资金费）：
+#        ┌────────┬────────┬────────┬──────────┬──────────┬────────┬────────┐
+#        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │
+#        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤
+#        │  15%   │ 127.1U │ 1.3298 │   22.4%  │   23.4%  │ −15.3% │  3.7x  │
+#        │  25%   │  76.3U │ 1.3298 │   38.9%  │   41.8%  │ −24.7% │  8.2x  │
+#        │  40%   │  47.7U │ 1.3310 │   55.5%  │   60.5%  │ −37.6% │ 24x    │
+#        │  60%   │  31.8U │ 1.3262 │   82.1%  │   90.5%  │ −52.4% │ 75x    │
+#        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘
+#    同期 ETH 买入持有：算数 74.9%  几何 51.0%
+#
+#  ⚠️ V2 默认【固定 60% 档】，不自动升档 —— 所以你只关心 60% 那一行。
+#     其余档位列在这里供 --target-vol 手动切换时参考。
+#  ⚠️ 手续费系数 = 1（不是 2）。证明见 align.py 的 `lag()` 之后那段注释。
+# ══════════════════════════════════════════════════════════════════════
 METHODS = [
-    ("固定版",          None,      14.2,   1.047, -0.712),
-    ("波动率目标 40%",    0.40,      52.3,   1.2442, -0.325),
-    ("波动率目标 25%",    0.25,      83.7,   1.2442, -0.211),
-    ("波动率目标 15%",    0.15,     139.5,   1.2442, -0.130),
+    ("固定版",          None,      14.2,   1.0457, -0.712),
+    ("波动率目标 60%",    0.60,      31.8,   1.3407, -0.525),
+    ("波动率目标 40%",    0.40,      47.7,   1.3453, -0.377),
+    ("波动率目标 25%",    0.25,      76.3,   1.3442, -0.248),
+    ("波动率目标 15%",    0.15,     127.1,   1.3442, -0.154),
 ]
 
 # ── 固定版的回撤随杠杆变（同一策略，只缩放仓位，夏普不变但回撤变）──
@@ -170,7 +205,7 @@ def fixed_position(equity):
         return 0.0
     return max(1.0, MIN_NOTIONAL / equity)
 
-ARCHIVE = ROOT / "data" / "live" / "ma50_log.csv"
+ARCHIVE = ROOT / "data" / "live" / "ma50_log.csv"   # V2 独立归档
 CACHE = ROOT / "data" / "crypto" / f"{SYM}.json"
 FUND = ROOT / "data" / "funding" / f"{SYM}.json"
 
@@ -198,6 +233,42 @@ def complete_bars(bars):
     if age < 86400 * 0.98:
         return bars[:-1], f"丢掉最后一根（只走了 {age/3600:.1f} 小时）"
     return bars, f"最后一根已走完（{age/3600:.1f} 小时前收）"
+
+
+def check_bar_continuity(bars, max_gap_h=25.0):
+    """
+    检查日线是否连续 —— 相邻两根应正好差 24 小时。
+
+    ⚠️ 为什么需要（2026-10-07 加）：
+       波动率是唯一【直接决定仓位】的输入。实测其失效模式：
+         · 数据不足 / 损坏  => 波动率【虚高】=> 仓位偏小 => 安全方向
+         · 但若窗口内【漏掉一天大跌】=> 波动率【虚低】=> 仓位偏大
+           => 过度杠杆 => 这是唯一指向危险方向的失效
+       而整数杠杆会吸收大部分数值误差（±20% 误差常仍在同一档），
+       所以真正要防的就是【数据缺口的语义错误】。
+
+    返回 (缺口列表, 说明)。缺口元素 = (前一根t, 后一根t, 间隔小时)。
+    """
+    if not bars or len(bars) < 2:
+        return [], "K 线不足 2 根，无法检查连续性"
+    gaps = []
+    for a, b in zip(bars, bars[1:]):
+        dh = (b["t"] - a["t"]) / 3600000.0
+        if dh > max_gap_h:
+            gaps.append((a["t"], b["t"], dh))
+    if not gaps:
+        return [], f"连续（{len(bars)} 根，无缺口）"
+    win_start = max(0, len(bars) - VOL_WINDOW - 2)
+    in_win = 0
+    for i, (a, b) in enumerate(zip(bars, bars[1:])):
+        if (b["t"] - a["t"]) / 3600000.0 > max_gap_h and i >= win_start:
+            in_win += 1
+    note = f"发现 {len(gaps)} 处缺口"
+    if in_win:
+        note += f"，其中 {in_win} 处在【波动率窗口内】=> 波动率可能虚低 => 仓位偏大"
+    else:
+        note += "（都不在波动率窗口内，影响有限）"
+    return gaps, note
 
 
 def refresh_funding(bn):
@@ -457,7 +528,7 @@ def dynamic_drawdown(bars, fund_by_day, start_equity):
 
     vol = np.full(n, np.nan)
     for i in range(21, n):
-        vol[i] = r[i - 20:i].std(ddof=1) * np.sqrt(365)
+        vol[i] = r[i - VOL_WINDOW:i].std(ddof=1) * np.sqrt(365)
 
     def _pos(eq_now, i):
         """
@@ -513,8 +584,16 @@ def dynamic_drawdown(bars, fund_by_day, start_equity):
 # ⚠️ bars 必须是【字典列表】（[{"c":...}]），不是 numpy 数组。
 #    传数组会报 IndexError: invalid index to scalar variable —— 不指向根因。
 #    要传数组请用 realized_vol_from_prices()（若有）。
-def realized_vol(bars, win=20):
-    """过去 win 根【已走完】日线的年化波动率。用于波动率目标版。"""
+def realized_vol(bars, win=None):
+    """
+    过去 win 根【已走完】日线的年化波动率。用于波动率目标版。
+
+    win=None ⇒ 用 VOL_WINDOW（V2 = 10；V1 曾经硬编码 20）
+    ⚠️ 用 ddof=1（样本标准差）—— 这个直接决定仓位，改成 ddof=0 会让仓位高 6.1%。
+       详见 ma50_rules.md §12。
+    """
+    if win is None:
+        win = VOL_WINDOW
     c = np.array([b["c"] for b in bars], float)
     if len(c) < win + 2:
         return float("nan")
@@ -527,6 +606,14 @@ def target_position(equity, rvol, method):
     返回目标仓位（占权益倍数）。method = (名称, 目标波动率, 门槛, ...)
     · 固定版：max(1.0, 20/权益) —— 不是常量
     · 波动率目标版：min(3, target_vol / 已实现波动)
+
+    ⚠️ V2 新增：波动率上限 VOL_CAP
+       已实现波动 > VOL_CAP 时【强制空仓】。
+       实测（2019-11 ~ 2026-10，10日窗口 + 60%档 + 3x 逐仓）：
+           无上限：强平 2 次，最坏逆向 −58.5%，年化 81.4%，夏普 1.234
+           上限120%：强平 0 次，最坏逆向 −27.0%，年化 89.8%，夏普 1.321
+       ⇒ 避开的是 2021-05-19（当日 10日波动 124.2%，持仓盘中 −58.5%）
+       ⇒ 有效区间很宽：90% ~ 130% 都能做到 0 次强平（不是单点拟合）
     """
     tv = method[1]
     if tv is None:
@@ -538,6 +625,8 @@ def target_position(equity, rvol, method):
             return 0.0
     except TypeError:
         return 0.0
+    if VOL_CAP is not None and rvol > VOL_CAP:
+        return 0.0                     # 波动率过高 ⇒ 空仓
     return float(min(3.0, tv / rvol))
 
 
@@ -550,7 +639,7 @@ def leverage_plan(equity, position, notional):
       · 仓位【大小】  →  由名义价值决定，与杠杆设置无关
 
     ⚠️ 为什么要报全仓和逐仓两个：
-       当名义 > 权益时（本工具在权益 < 52.3U 时都是这样），
+       当名义 > 权益时（本工具在权益 < 31.7U 时都是这样），
        逐仓只锁 notional/杠杆 做保证金，强平反而更近；
        全仓用整个权益做保证金，强平更远。
        仓位本来就比账户大时，【全仓才是更安全的那个】。
@@ -592,6 +681,19 @@ def advice(equity, price, rvol=None):
 
     返回一个 dict，含所有中间量，供显示和归档共用。
     """
+    # ⚠️ 边界防护（2026-10-07 审计发现）：
+    #    · equity=None ⇒ 旧代码在 `equity < mneed` 处抛 TypeError
+    #    · price<=0    ⇒ qty 算出 nan/负值，但 feasible 仍报 True
+    #    实际不可达（equity 来自账户、price 来自行情），但防护应与
+    #    target_position 对 rvol=None 的处理保持一致。
+    if equity is None or price is None:
+        return {"method": "—", "position": 0.0, "notional": 0.0, "qty": 0.0,
+                "feasible": False, "fail": "bad_input", "threshold": 0.0,
+                "reason": "输入无效（equity/price 为 None）"}
+    if price <= 0:
+        return {"method": "—", "position": 0.0, "notional": 0.0, "qty": 0.0,
+                "feasible": False, "fail": "bad_price", "threshold": 0.0,
+                "reason": f"价格无效（{price}）"}
     mname, tv, mneed, msr, mdd_tab, nxt, gap = pick_method(equity)
     forced = TARGET_VOL_OVERRIDE is not None
     pos = target_position(equity, rvol, (mname, tv, mneed, msr, mdd_tab))
@@ -792,7 +894,7 @@ def run(a):
     #    而 w[i-1] 用的是 vol20[i-1] = r[i-21:i-1].std()，
     #    即【截至第 i-2 根收盘】的窗口。差一天，容易被误读成滚动一天。
     #    （这个歧义曾让一份外部复核多滞后一天，得到 −41.3% 而非 −32.5%。）
-    rvol = realized_vol(bars)          # 供波动率目标版用（无前视：只用已走完的）
+    rvol = realized_vol(bars, VOL_WINDOW)   # V2 用 10 日窗口
     # 兜底默认值。读账户失败时 eq 为 None，归档里的建议字段是空的，
     # 所以这些默认值只影响 decide_action 的判断，不影响下单量。
     #
@@ -831,7 +933,7 @@ def run(a):
             A("  该下多少（按本金自动匹配版本）")
             A("  " + "-" * 74)
             if rvol is not None and np.isfinite(rvol):
-                A(f"  20 日已实现波动   {rvol*100:.1f}%  （波动率目标版要用）")
+                A(f"  {VOL_WINDOW} 日已实现波动   {rvol*100:.1f}%  （波动率目标版要用）")
                 A("")
             _tag = "（--target-vol 强制）" if TARGET_VOL_OVERRIDE is not None else ""
             A(f"  账户权益 {eq:,.2f} USDT  ⇒  匹配版本：**{adv['method']}**{_tag}")
@@ -931,17 +1033,27 @@ def run(a):
                 A(f"   全仓强平   标的 {lp['liq_cross_px']*100:>5.1f}%   "
                   f"账户 {lp['liq_cross_acc']*100:>6.1f}%")
                 A("")
-                # 强平判断：和【单笔最坏逆向】比，不是和【累计回撤】比。
-                A(f"   62 笔交易的期间最坏逆向   {WORST_TRADE_LOW*100:.1f}%（最低价口径）")
+                # ⚠️ V2 修正：旧版这里写「62 笔最坏逆向 −26.6%」——
+                #    那是**相对信号入场价**算的，不是**相对加权开仓价**。
+                #    加权开仓价口径下，最坏盘中逆向是 −48.6%（2021-05-19），
+                #    因为前几天持续加仓把成本推高了。
+                #    ⇒ 3x 的 −32.9% 挡不住它，旧版的「不会触发强平」是错的。
+                #    V2 改用「波动率上限 120%」解决（实测强平 2 次 → 0 次）。
+                A(f"   62 笔交易的期间最坏逆向   {WORST_TRADE_LOW*100:.1f}%"
+                  f"（相对信号入场价）")
+                A(f"   同口径换成加权开仓价的最坏值   −48.6%（2021-05-19）")
                 if lp["safe"]:
-                    A(f"   ✅ 逐仓不会触发强平（强平线 {lp['liq_iso_px']*100:.1f}% "
-                      f"比最坏单笔远 "
-                      f"{(lp['liq_iso_px'] - abs(WORST_TRADE_LOW))*100:.1f}pp）")
+                    A("   ✅ 当前配置实测 0 次强平 —— 靠的是 V2 的波动率上限")
+                    A(f"      · 3x 的强平线是标的 {lp['liq_iso_px']*100:.1f}%，"
+                      f"而历史最坏盘中逆向 −58.5% 会穿过它")
+                    A(f"      · 但 V2 在 10 日波动 > {VOL_CAP*100:.0f}% 时强制空仓，"
+                      f"正好避开那几次")
+                    A("      · 实测：无上限强平 2 次 → 有上限 0 次")
+                    A("      ⚠️ 但瞬间跳变（波动率从 20% 直接跳到 130%）仍可能打穿")
                 else:
                     A(f"   ❌ 逐仓【会被强平】：强平线 {lp['liq_iso_px']*100:.1f}% "
                       f"比最坏单笔({WORST_TRADE_LOW*100:.1f}%)更近")
-                    A(f"      这是杠杆设置 {lp['lev']}x 太高导致的 —— "
-                      f"降到 {MAX_SAFE_LEV}x 以下才安全")
+                    A(f"      杠杆设置 {lp['lev']}x 太高 —— 降到 {MAX_SAFE_LEV}x 以下")
                 A(f"   触发强平后剩多少：逐仓 {eq - lp['liq_iso_px']*tgt_n:.2f}U"
                   f"   全仓 {eq - lp['liq_cross_px']*tgt_n:.2f}U")
                 A(f"      ⇒ 逐仓【账户下限更高】（亏掉保证金就停，不会穿仓）")
@@ -1265,7 +1377,7 @@ def selfcheck():
           f"{'整数':>6}{'够开':>6}{'逐仓强平':>11}{'全仓强平':>11}")
     print("     " + "-" * 70)
     lev_bad = []
-    for eq in (14.20, 14.8, 16, 18, 19.99, 20, 30, 52.3, 100):
+    for eq in (14.20, 14.8, 16, 18, 19.99, 20, 30, 31.7, 47.5, 100):
         a = advice(eq, 2700.0, 0.445)
         lp = a.get("lev_plan")
         if lp is None:
@@ -1347,6 +1459,9 @@ def main():
         load_cache(_BN(), rebuild=True)
         return
     global TARGET_VOL_OVERRIDE
+    # V2：默认锁定 60% 档（不给 --target-vol 时）
+    if a.target_vol is None:
+        TARGET_VOL_OVERRIDE = DEFAULT_TARGET_VOL
     if a.target_vol is not None:
         v = a.target_vol / 100.0 if a.target_vol > 1 else a.target_vol
         # ⚠️ 原来只在 METHODS 里精确匹配，等于人为限制成 15/25/40 三档。

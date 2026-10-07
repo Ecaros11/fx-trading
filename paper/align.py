@@ -38,6 +38,27 @@
 """
 import numpy as np
 
+# ══════════════════════════════════════════════════════════════════════
+#  ⚠️ 这两个常量必须与 ma50_live.py 完全一致
+#     否则 --selfcheck 会拿"20 日窗口的策略"去对比"10 日窗口的表格"，
+#     报出一堆假警报，而真正的口径不一致反而检测不到。
+#
+#  2026-10-07 修：这两个常量以前是硬编码的 20 / 无上限，
+#     工具改成 10 日 + VOL_CAP 后 align.py 没跟着改 —— 结构性缺陷。
+#     现在改成从 ma50_live.py 直接读取，杜绝再次漂移。
+# ══════════════════════════════════════════════════════════════════════
+def _read_tool_constants():
+    import importlib.util
+    import pathlib
+    p = pathlib.Path(__file__).with_name("ma50_live.py")
+    spec = importlib.util.spec_from_file_location("_ml_const", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod.VOL_WINDOW, mod.VOL_CAP
+
+
+VOL_WIN, VOL_CAP = _read_tool_constants()      # 10, 1.20
+
 PY = 365.0
 
 
@@ -90,11 +111,15 @@ def sma(x, k):
     return o
 
 
-def realized_vol(r, i, win=20):
+def realized_vol(r, i, win=None):
     """
     截至第 i-1 根收盘的年化已实现波动（不含当期收益 ⇒ 无前视）。
     r 必须是 daily_ret(C) 的结果。
+
+    win=None ⇒ 用 VOL_WIN（从 ma50_live.py 读，V2 = 10 日）
     """
+    if win is None:
+        win = VOL_WIN
     if i < win + 1:
         return np.nan
     w = r[i - win:i]
@@ -145,24 +170,33 @@ class panel:
         self.ma50 = sma(self.C, 50)
         self.sig = np.nan_to_num((self.C > self.ma50).astype(float))
         # 已实现波动（滞后，无前视）
-        self.vol20 = np.full(self.n, np.nan)
-        for i in range(21, self.n):
-            self.vol20[i] = realized_vol(self.r, i, 20)
+        # ⚠️ 窗口和上限都从 ma50_live.py 读 —— 不要在这里写死
+        self.vol = np.full(self.n, np.nan)
+        for i in range(VOL_WIN + 1, self.n):
+            self.vol[i] = realized_vol(self.r, i, VOL_WIN)
 
-    def weight(self, tv=None, lev=1.405, cap=3.0):
-        """目标仓位（占权益倍数）。tv=None → 固定 lev"""
+    def weight(self, tv=None, lev=1.405, cap=3.0, vol_cap="auto"):
+        """
+        目标仓位（占权益倍数）。tv=None → 固定 lev
+
+        vol_cap：波动率上限。'auto' 表示用工具里的 VOL_CAP（V2 = 1.20）；
+                 None 表示关闭该保护（用于对照实验）。
+        """
         if tv is None:
             return np.nan_to_num(self.sig * lev)
-        raw = np.where(np.isfinite(self.vol20) & (self.vol20 > 1e-9),
-                       tv / np.where(self.vol20 > 1e-9, self.vol20, 1.0), 0.0)
+        vc = VOL_CAP if vol_cap == "auto" else vol_cap
+        raw = np.where(np.isfinite(self.vol) & (self.vol > 1e-9),
+                       tv / np.where(self.vol > 1e-9, self.vol, 1.0), 0.0)
+        if vc is not None:
+            raw = np.where(self.vol > vc, 0.0, raw)      # 波动率过高 ⇒ 空仓
         return np.nan_to_num(self.sig * np.clip(raw, 0, cap))
 
-    def net(self, tv=None, lev=1.405, warmup=0):
+    def net(self, tv=None, lev=1.405, warmup=0, vol_cap="auto"):
         """
         返回对齐正确的净收益序列（长度 n，前 warmup 项为 0）。
         调用方自己切 [warmup:]。
         """
-        w = self.weight(tv, lev)
+        w = self.weight(tv, lev, vol_cap=vol_cap)
         wl = lag(w)                                  # ✅ 关键：滞后一天
         turn = np.abs(np.diff(np.concatenate([[0.0], wl])))
         fr = lag(self.FR)

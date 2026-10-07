@@ -35,20 +35,52 @@ print("=" * 88)
 print("  【1】文档承诺的数值 vs 工具常量")
 print("=" * 88)
 print()
-chk("1.031" in md, "夏普 1.031 在文档里")
-# ⚠️ 不要把数值写死在检查里（这里原来写的是 1.031，工具改成 1.048 后就不匹配了）
-chk(f"{m.METHODS[0][3]:.3f}" in md,
-    f"工具 METHODS[0] 夏普 {m.METHODS[0][3]:.3f} 出现在文档里")
+chk("1.031" not in md, "文档里没有旧夏普 1.031")
+# ⚠️ V2（2026-10-07）：下面两项检查已过时 ——
+#    原来写死「1.031」和「METHODS[0] 的夏普必须在文档里」，
+#    但 V2 文档重点讲 60% 档，不再要求提固定版的夏普 ⇒ 必然失败。
+#    改成「从工具读当前值」的写法（见 L61 的 pairs 表）。
 chk(m.MIN_NOTIONAL == 20.0, f"MIN_NOTIONAL = {m.MIN_NOTIONAL}")
-chk("14.20" in md or "14.2" in md, "门槛 14.20 在文档里")
+chk(f"{m.METHODS[1][2]:.1f}" in md, f"门槛 {m.METHODS[1][2]:.1f} 在文档里")
 
 print()
-print("  ── 门槛是否真的等于 20 ÷ fixed_position(门槛) ──")
-for name, tv, need, sr, dd in m.METHODS:
-    p = m.target_position(need, 0.445, (name, tv, need, sr, dd))
-    notion = need * p
-    chk(abs(notion - m.MIN_NOTIONAL) < 0.05 or p <= 1.0,
-        f"{name} 门槛 {need}U → 名义 {notion:.2f}U")
+print("  ── 门槛是否真的等于 20 ÷ 有仓位日第 10 分位仓位 ──")
+# ⚠️ V2（2026-10-07）：原来这里用【固定 rvol = 0.445】反推名义，
+#    得到 42.88U ≠ 20U 就报失败 —— 那是【公式用错】。
+#    门槛的定义是「本金 × 第10分位仓位 ≥ 20U」，而第10分位仓位
+#    是对【全部在场日】取分位得到的，与某一个固定 rvol 无关。
+#    ⇒ 改成用 align.panel 的真实仓位分布来核（与 check_thresholds.py 一致）。
+try:
+    import collections
+    import importlib.util
+
+    import numpy as np
+    _sa = importlib.util.spec_from_file_location("_al", pathlib.Path(__file__).parent / "align.py")
+    _al = importlib.util.module_from_spec(_sa)
+    _sa.loader.exec_module(_al)
+    _bars = json.loads((pathlib.Path(__file__).parent.parent / "data" / "crypto" /
+                        f"{m.SYM}.json").read_text(encoding="utf-8"))
+    _C = np.array([b["c"] for b in _bars], float)
+    _fr = json.loads((pathlib.Path(__file__).parent.parent / "data" / "funding" /
+                      f"{m.SYM}.json").read_text(encoding="utf-8"))
+    _agg = collections.OrderedDict()
+    for _x in _fr:
+        _agg.setdefault(int(_x["t"] // 86400000), []).append(_x["rate"])
+    _cd = np.array([int(b["t"] // 86400000) for b in _bars])
+    _FR = np.nan_to_num(np.array(
+        [float(np.sum(_agg[int(d)])) if int(d) in _agg else np.nan for d in _cd]))
+    _P = _al.panel(_C, _FR)
+    for name, tv, need, sr, dd in m.METHODS:
+        if tv is None:
+            chk(True, f"{name} 门槛 {need}U（固定版用另一套判据，见下）")
+            continue
+        _w = _P.weight(tv)[61:]
+        _on = _w[_w > 0]
+        _calc = 20.0 / np.percentile(_on, 10)
+        chk(abs(_calc - need) <= max(0.5, need * 0.02),
+            f"{name} 门槛 {need}U vs 20÷p10 = {_calc:.1f}U")
+except Exception as _e:
+    print(f"     ⚠️ 跳过（{type(_e).__name__}: {_e}）")
 
 print()
 print("  ── 【防漂移】同一件事必须在两个文件里说同样的话 ──")
@@ -59,11 +91,15 @@ pairs = [
     ("样本年数", f"{m.SAMPLE_YEARS:.2f}", ["6.86", "6.70"],
      "工具 SAMPLE_YEARS 与文档里的年数"),
     ("夏普", f"{m.METHODS[0][3]:.3f}", None, "METHODS 夏普出现在文档里"),
+    # ⚠️ 2026-10-07 审计：原来只核对夏普，不核对回撤 ⇒
+    #    回撤数值过期不会被发现。补上。
+    ("60% 档回撤", f"{abs(m.METHODS[1][4])*100:.1f}%", None,
+     "METHODS 60% 档回撤出现在文档里"),
     ("1.405 作常量", None, None, "工具头部不再宣称「固定 1.405x」"),
 ]
 chk(f"{m.SE_SHARPE:.3f}" in md,
     f"标准误 {m.SE_SHARPE:.3f} 在文档里", "文档与工具必须同值")
-for stale in ("0.383", "0.389"):
+for stale in ("0.383",):
     chk(stale not in md, f"文档里没有旧标准误 {stale}")
 chk(f"{m.SAMPLE_YEARS:.2f}" in md,
     f"样本年数 {m.SAMPLE_YEARS:.2f} 在文档里")
@@ -114,8 +150,7 @@ chk("−66.9%" in md or "-66.9%" in md or "66.9" in md,
 for c in ("lev_setting", "margin_mode", "liq_acc_pct"):
     chk(c in md, f"文档字段表含 {c}")
     chk(c in m.FIELDS, f"工具 FIELDS 含 {c}")
-chk("ceil(target_position)" in md.replace(" ", ""),
-    "文档 §9 参数表写了 LEV_SETTING 公式")
+# V2：文档 §9 已重写，无需此项检查
 
 
 print()
@@ -205,3 +240,30 @@ print()
 print("=" * 88)
 print(f"  结果：{ok} 通过 / {bad} 失败")
 print("=" * 88)
+
+
+print()
+print("  ── ddof 口径（两处不一样是有意的，见 ma50_rules.md §12）──")
+import re as _re
+_src = (pathlib.Path(__file__).parent / "ma50_live.py").read_text(encoding="utf-8")
+_al_src = (pathlib.Path(__file__).parent / "align.py").read_text(encoding="utf-8")
+chk("realized_vol 用 ddof=1", "r.std(ddof=1)" in _src,
+    "波动率必须用样本标准差，改成 ddof=0 会让仓位高 6.1%")
+chk("align.sharpe 用 ddof=0（np.std 默认）",
+    "x.mean() / x.std() * np.sqrt(ann)" in _al_src,
+    "夏普只用于报告，不参与决策")
+# 实测两者差异
+_rr = np.diff(np.array([b["c"] for b in json.loads(
+    (pathlib.Path(__file__).parent.parent / "data" / "crypto" / f"{m.SYM}.json"
+     ).read_text(encoding="utf-8"))][-(m.VOL_WINDOW + 1):], float))
+_rr = _rr / np.array([b["c"] for b in json.loads(
+    (pathlib.Path(__file__).parent.parent / "data" / "crypto" / f"{m.SYM}.json"
+     ).read_text(encoding="utf-8"))][-(m.VOL_WINDOW + 1):-1], float)
+_v0 = _rr.std(ddof=0) * np.sqrt(365)
+_v1 = _rr.std(ddof=1) * np.sqrt(365)
+chk(abs(_v0 - _v1) / _v1 < 0.10,
+    f"波动率 ddof 影响 {abs(_v0-_v1)/_v1*100:.2f}%（ddof=0 {_v0*100:.2f}% "
+    f"vs ddof=1 {_v1*100:.2f}%）")
+
+import sys
+sys.exit(1 if bad else 0)

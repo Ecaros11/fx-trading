@@ -31,10 +31,10 @@ print()
 print(f"  {'权益':>9}{'目标仓位':>10}{'最小整数杠杆':>13}{'名义':>9}{'保证金':>9}"
       f"{'富余':>9}{'强平@标的':>11}{'账户回撤@强平':>14}")
 print("  " + "-" * 86)
-for eq in (14.20, 14.83, 16, 18, 20, 25, 30, 52.3):
+for eq in (14.20, 14.83, 16, 18, 20, 25, 30, 47.5):
     if eq < 14.20:
         continue
-    pos = max(1.0, MIN_NOTIONAL / eq) if eq < 52.3 else 0.899
+    pos = max(1.0, MIN_NOTIONAL / eq) if eq < 47.5 else 0.899
     notion = eq * pos
     need_lev = notion / eq                    # 使保证金恰好 = 权益
     lev = int(np.ceil(need_lev - 1e-9))       # 最小整数杠杆
