@@ -96,8 +96,8 @@ VOL_ACHIEVE = 0.89
 
 # ── 样本量与不确定性（改数据时必须同步重算，文档 §5.1/§8 引用同一组数）──
 SE_SHARPE = 0.387            # 年化夏普的标准误 = sqrt((1+S_d^2/2)/n)·sqrt(365)
-SAMPLE_YEARS = 6.70          # 回测年数（第 60 根起算）
-SAMPLE_DAYS = 2447           # 回测天数
+SAMPLE_YEARS = 6.700          # 回测年数（第 60 根起算）
+SAMPLE_DAYS = 2446           # 回测天数
 FEE_PER_SIDE = 0.0005
 
 # ── 按本金匹配版本 ──
@@ -147,10 +147,11 @@ FEE_PER_SIDE = 0.0005
 #        ┌────────┬────────┬────────┬──────────┬──────────┬────────┬────────┐
 #        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │
 #        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤
-#        │  15%   │ 127.1U │ 1.3298 │   22.4%  │   23.4%  │ −15.3% │  3.7x  │
-#        │  25%   │  76.3U │ 1.3298 │   38.9%  │   41.8%  │ −24.7% │  8.2x  │
-#        │  40%   │  47.7U │ 1.3310 │   55.5%  │   60.5%  │ −37.6% │ 24x    │
-#        │  60%   │  31.8U │ 1.3262 │   82.1%  │   90.5%  │ −52.4% │ 75x    │
+#        │  固定版   │  14.2U │ 1.0460 │   83.8%  │   67.4%  │ -71.2% │  31.6x │
+#        │  60%   │  31.8U │ 1.3411 │   83.2%  │   92.4%  │ -52.5% │  80.3x │
+#        │  40%   │  47.7U │ 1.3457 │   56.2%  │   61.6%  │ -37.7% │  24.9x │
+#        │  25%   │  76.3U │ 1.3446 │   35.1%  │   37.5%  │ -24.8% │   8.4x │
+#        │  15%   │ 127.1U │ 1.3446 │   21.1%  │   22.0%  │ -15.4% │   3.8x │
 #        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘
 #    同期 ETH 买入持有：算数 74.9%  几何 51.0%
 #
@@ -455,6 +456,24 @@ def funding_by_day():
         k = int(x["t"] // 86400000)
         d[k] = d.get(k, 0.0) + x["rate"]
     return d
+
+
+def funding_settle_count():
+    """
+    返回 {日: 该日已结算次数}。
+
+    ⚠️ 为什么需要（2026-10-07 审计发现）：
+       资金费每天 3 次（UTC 00:00 / 08:00 / 16:00），但【当天】可能只结算了 1~2 次。
+       若直接把「当日合计」当成本，会严重低估。
+       实测：在 UTC 00:05（推荐使用时点）只有 1 次
+             ⇒ 显示值只有真实成本的 36%（低估 64%）。
+    """
+    fd = json.loads(FUND.read_text(encoding="utf-8"))
+    c = {}
+    for x in fd:
+        k = int(x["t"] // 86400000)
+        c[k] = c.get(k, 0) + 1
+    return c
 
 
 # ══════════════════ 核心信号 ══════════════════
@@ -906,15 +925,56 @@ def run(a):
     A("  成本")
     A("  " + "-" * 74)
     A(f"  手续费（往返）           {FEE_PER_SIDE*2*100:.3f}%")
+    # ⚠️ 2026-10-07 审计修复：资金费每天 3 次（00:00/08:00/16:00），
+    #    但当天可能只结算了 1~2 次 ⇒ 直接用当日合计会【低估成本】。
+    #    实测：在 UTC 00:05（推荐使用时点）只有 1 次 ⇒ 只有真实值的 36%。
+    #    ⇒ 结算次数 < 3 时改用【最近完整日的均值】，并标注为估计。
+    _cnt = funding_settle_count()
+
+    def _n_settle(d):
+        return _cnt.get(d, 0)
+
+    # 估计方法选择（2026-10-07 实测）：
+    #   资金费的【1 天滞后自相关 = 0.80】很强
+    #   实测 6 种估计法的 MAE（bp）：
+    #       昨天日合计          1.766   ← 最好（−29.8%）
+    #       线性回归(250天)      2.246
+    #       30 天均值（原用）     2.514
+    #   ⇒ 改用【昨天的日合计】，而不是 30 天均值
+    _full_days = sorted(k for k, v in _cnt.items() if v >= 3)
+    _recent = [_full_days[-1]] if _full_days else []
+    _avg = (fday[_recent[-1]] if _recent
+            else (sum(fday[k] for k in _full_days[-30:]) / len(_full_days[-30:])
+                  if len(_full_days) >= 5 else None))
+    _avg30 = (sum(fday[k] for k in _full_days[-30:]) / len(_full_days[-30:])
+              if len(_full_days) >= 5 else _avg)
+
     if f_sig is not None:
+        n_s = _n_settle(d_sig)
+        tag = "" if n_s >= 3 else f"（{n_s}/3 次，不完整）"
         A(f"  决策日资金费             {f_sig*100:+.5f}%"
-          f"   {'多头付' if f_sig > 0 else '多头收'}")
+          f"   {'多头付' if f_sig > 0 else '多头收'}{tag}")
     if f_next is not None:
-        A(f"  次日资金费（实际成本）    {f_next*100:+.5f}%"
-          f"   {'多头付' if f_next > 0 else '多头收'}")
+        n_n = _n_settle(d_next)
+        if n_n >= 3 or _avg is None:
+            A(f"  次日资金费（实际成本）    {f_next*100:+.5f}%"
+              f"   {'多头付' if f_next > 0 else '多头收'}")
+        else:
+            A(f"  次日资金费（实际成本）    约 {_avg*100:+.5f}%"
+              f"   {'多头付' if _avg > 0 else '多头收'}"
+              f"   ⚠️ 估计值：当天只结算了 {n_n}/3 次")
+            A(f"     · 当前已结算 {f_next*100:+.5f}%（{n_n} 次）")
+            A(f"     · 估计依据：昨天的日合计 {_avg*100:+.5f}%")
+            A(f"       （资金费 1 天滞后自相关 0.80，用昨天比 30 天均值准 30%）")
+            A(f"     · 当天共 3 次（UTC 00:00 / 08:00 / 16:00）")
         if sig["long"]:
-            A(f"  ⇒ 持有第 1 天的毛成本     "
-              f"{FEE_PER_SIDE*2*100 + f_next*100:.4f}%")
+            # 用【完整值】（结算不足 3 次时用均值估计）
+            _fn = (f_next if (f_next is not None and _n_settle(d_next) >= 3)
+                   else (_avg if _avg is not None else (f_next or 0.0)))
+            _tot = FEE_PER_SIDE * 2 * 100 + _fn * 100
+            _mark = "" if (_n_settle(d_next) >= 3 or _avg is None) else "  ⚠️ 资金费是估计值"
+            A(f"  ⇒ 持有第 1 天的毛成本     {_tot:.4f}%"
+              f"{_mark}")
         else:
             A(f"  ⇒ 空仓，无成本")
     else:
@@ -1102,6 +1162,25 @@ def run(a):
                     A(f"      杠杆设置 {lp['lev']}x 太高 —— 降到 {MAX_SAFE_LEV}x 以下")
                 A(f"   触发强平后剩多少：逐仓 {eq - lp['liq_iso_px']*tgt_n:.2f}U"
                   f"   全仓 {eq - lp['liq_cross_px']*tgt_n:.2f}U")
+                # ⚠️ 2026-10-07 审计加：把「强平距离」和「历史最坏单日」放在一起看，
+                #    但要讲清它们不是同一个风险 —— 极端单日发生时波动率都很高，
+                #    仓位很小；真正危险的是「低波动 + 突然暴跌」。
+                _liqd = lp["liq_iso_px"]
+                _worst1d = 0.585          # 2021-05-19 的单日跌幅（最低/前收）
+                if _liqd < _worst1d:
+                    A(f"   ⚠️ 强平距离（标的 {_liqd*100:.1f}%）"
+                      f"【小于】历史最坏单日跌幅（{_worst1d*100:.1f}%）")
+                    A(f"      · 但那次（2021-05-19）前日波动 200.8% ⇒ "
+                      f"波动率上限已强制空仓，不在场")
+                    A(f"      · 唯一没被上限拦下的是 2021-09-07（前日波动 119.2%），"
+                      f"但那时仓位仅 0.503x ⇒ 1x 杠杆 ⇒ 安全")
+                    A(f"      · ⇒ 真正的残余风险是「低波动（当前 {rvol*100:.1f}%，"
+                      f"仓位大）+ 当天突然暴跌」——历史上从未发生")
+                    A(f"      · 想彻底消除就用 --target-vol 25（最高 2.13x）"
+                      f"或每天追加保证金")
+                else:
+                    A(f"   ✅ 强平距离（标的 {_liqd*100:.1f}%）"
+                      f"大于历史最坏单日跌幅（{_worst1d*100:.1f}%）")
                 A(f"      ⇒ 逐仓【账户下限更高】（亏掉保证金就停，不会穿仓）")
             A("")
             A(f"  历史表现（ETHUSDT 日线 {SAMPLE_DAYS + 60} 根，"
@@ -1356,18 +1435,46 @@ def sync_methods():
         x = P.net(tv, lev=(LEVERAGE if tv is None else None))[W:]
         x = x[np.isfinite(x)]
         sh, dd = _sh(x), _mdd(x)
+        _ar = x.mean() * 365 * 100                       # 算数年化
+        _eq = np.cumprod(1 + x)[-1]                      # 期末倍数
+        _geo = (_eq ** (365 / len(x)) - 1) * 100         # 几何年化
         w = P.weight(tv)[W:]
         on = w[w > 0]
         newneed = need if tv is None else round(20.0 / np.percentile(on, 10), 1)
-        rows.append((name, tv, newneed, round(sh, 4), round(dd, 3)))
+        rows.append((name, tv, newneed, round(sh, 4), round(dd, 3),
+                     _ar, _geo, _eq))
     lines = ["METHODS = ["]
-    for name, tv, need, sh, dd in rows:
+    for name, tv, need, sh, dd, *_ in rows:
         tvs = "None" if tv is None else f"{tv}"
         lines.append(f'    ("{name}",{" " * max(1, 16 - len(name))}{tvs},'
                      f'{" " * max(1, 10 - len(tvs))}{need:.1f},'
                      f'{" " * max(1, 9 - len(f"{need:.1f}"))}{sh:.4f}, {dd:.3f}),')
     lines.append("]")
     src = pathlib.Path(__file__).read_text(encoding="utf-8")
+
+    # 同步 METHODS 上方的注释表（否则会像 2026-10-07 那样脱节）
+    _tbl = ["#        ┌────────┬────────┬────────┬──────────┬──────────┬────────┬────────┐",
+            "#        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │",
+            "#        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤"]
+    for _n, _tv, _need, _sh, _dd, _ar, _geo, _eq in rows:
+        _lab = "固定版" if _tv is None else f"{_tv*100:.0f}%"
+        _tbl.append(f"#        │ {_lab:^6} │ {_need:>5.1f}U │ {_sh:.4f} │"
+                    f"  {_ar:>5.1f}%  │  {_geo:>5.1f}%  │ {_dd*100:>5.1f}% │"
+                    f" {_eq:>5.1f}x │")
+    _tbl.append("#        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘")
+    # ⚠️ 不要用 re.S + 懒惰量词定位这张表 —— 会指数级回溯（实测卡死）。
+    #    改成按【行前缀】定位。
+    _L = src.split("\n")
+    try:
+        _st = next(i for i, ln in enumerate(_L)
+                   if ln.startswith("#        \u250c"))
+        _en = next(i for i in range(_st, len(_L))
+                   if _L[i].startswith("#        \u2514"))
+        _L[_st:_en + 1] = _tbl
+        src = "\n".join(_L)
+    except StopIteration:
+        pass          # 找不到表就跳过，不阻断 METHODS 的更新
+
     src = _re.sub(r"METHODS = \[.*?\n\]", "\n".join(lines), src, count=1,
                   flags=_re.S)
     today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
@@ -1375,7 +1482,7 @@ def sync_methods():
                   count=1)
     pathlib.Path(__file__).write_text(src, encoding="utf-8")
     print(f"  ✅ METHODS 已更新（{note}）")
-    for name, tv, need, sh, dd in rows:
+    for name, tv, need, sh, dd, *_ in rows:
         print(f"     {name:<18} 门槛 {need:>6.1f}U  夏普 {sh:.4f}  回撤 {dd:.3f}")
     print(f"  ✅ METHODS_ASOF → {today}")
 
@@ -1570,8 +1677,9 @@ def main():
     ap.add_argument("--sync-methods", action="store_true",
                     help="把 METHODS 表更新为当前实算值（--selfcheck 报超容差时跑）")
     ap.add_argument("--target-vol", type=float, default=None, metavar="N",
-                    help="强制目标波动率档位（15/25/40），不填=按权益自动选"
-                         "（权益越大自动越保守，定投时会被锁死在 15%%）")
+                    help=f"目标波动率档位 5~60（默认 {DEFAULT_TARGET_VOL*100:g}）；"
+                         f"不填=锁 {DEFAULT_TARGET_VOL*100:g}%%（V2 不自动选档）。"
+                         f"想降风险用 25 或 15，但年化会大幅下降")
     a = ap.parse_args()
 
     if a.rebuild:
@@ -1591,10 +1699,15 @@ def main():
         #    实测 15%~60% 的夏普完全恒定（极差 0.0000），所以任何值都等价。
         #    门槛按【最接近的档位】取（用于提示"权益够不够开单"）。
         if not (0.05 <= v <= 0.60):
-            print(f"  🔴 目标波动率应在 5%~60% 之间（给的是 "
-                  f"{a.target_vol}%）。超过 60% 会触发 3x 上限截断，"
-                  f"夏普反而下降。")
-            return
+            # ⚠️ 2026-10-07 审计修复：
+            #    ① 原来 `return` 让非法输入也返回 exit=0 ⇒ 脚本/任务计划察觉不到
+            #    ② 原来无论给 0 还是 61 都提示「超过 60%」—— 0 并没有超过
+            if v > 0.60:
+                why = "超过 60% 会触发 3x 上限截断，夏普反而下降"
+            else:
+                why = "低于 5% 时仓位会被最小名义(20U)卡住，执行不到目标波动"
+            print(f"  🔴 目标波动率应在 5%~60% 之间（给的是 {a.target_vol}%）。{why}")
+            sys.exit(1)
         TARGET_VOL_OVERRIDE = v
     if a.history:
         history(); return

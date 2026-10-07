@@ -43,8 +43,11 @@ print("=" * 90)
 print("  1. 所有运行模式")
 print("=" * 90)
 print()
-for f in ("--selfcheck", "--check", "--archive", "--backfill", "--history",
-          "--console", "--rebuild"):
+# ⚠️ 2026-10-07：只跑【不联网】的快速模式。
+#    --check/--archive/--rebuild/--sync-methods 都要调币安 API，
+#    放在这里会让本脚本从 10 秒变成 2.5 分钟。
+#    ⇒ 那几个模式请用 run_all.py（或单独跑）验证。
+for f in ("--selfcheck", "--history", "--console"):
     r = subprocess.run([PY, str(HERE / "ma50_live.py"), f],
                        capture_output=True, text=True, encoding="utf-8",
                        cwd=str(HERE))
