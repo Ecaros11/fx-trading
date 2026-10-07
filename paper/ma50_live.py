@@ -78,7 +78,7 @@ MAX_SAFE_LEV = 3
 # ⚠️ 那个自动逻辑有个副作用：门槛是 20U ÷ 仓位 算出来的，
 #    所以权益越大 → 落到门槛越高的档 → 而门槛最高的档恰好是
 #    目标波动【最低】的 15% 档 ⇒ 赚到钱之后自动降杠杆。
-#    定投场景下尤其明显：权益一过 139.5U 就永久锁在 15%。
+#    定投场景下尤其明显：权益一过最高门槛就永久锁在 15%。
 #    用 --target-vol 40 可以强制锁定某一档。
 TARGET_VOL_OVERRIDE = None
 
@@ -105,7 +105,7 @@ FEE_PER_SIDE = 0.0005
 # 含义：本金达到门槛后，≥90% 的有仓位日都能下出最小单。
 # 这组数是从 ETHUSDT 日线算出来的（calc_thresholds.py），不是拍的。
 # 注意两个数不是一回事：
-#   日线总根数 2505  →  减 60 根预热  →  回测样本 SAMPLE_DAYS = 2445 天
+#   日线总根数随数据增长；减 60 根预热 → 回测样本 SAMPLE_DAYS
 #
 # ⚠️ 「目标波动率」是【在场时】的目标，不是账户整体波动：
 #       仓位 × 已实现波动 = 目标        ← 恒等式，精确成立（未触发 3x 上限时）
@@ -122,7 +122,7 @@ FEE_PER_SIDE = 0.0005
 #   · 算术夏普 = 日均收益 / 日标准差 × sqrt(365)
 #   · 收益对齐 = w[t-1] × r[t]（昨天收盘决定，今天持有）—— 不是 w[t] × r[t]
 #   · 含成本   = 手续费 5bp/边 × |Δw|（系数 1！不是 2）+ 每日实际资金费
-#   · 数据     = ETHUSDT 永续，日线 2505 根；回测样本 2445 天 = 6.69 年（第 60 根起算）
+#   · 数据     = ETHUSDT 永续日线；回测样本见 SAMPLE_DAYS / SAMPLE_YEARS（第 60 根起算）
 #   · 回撤     = 【每天对账到 min(3, 目标÷20日波动)】的复利净值最大回撤，
 #               含换手手续费与每日资金费。即实际执行路径的回撤，不是标称口径。
 #               40% 档在场平均仓位 0.6549（供核对）。
@@ -158,16 +158,23 @@ FEE_PER_SIDE = 0.0005
 #     其余档位列在这里供 --target-vol 手动切换时参考。
 #  ⚠️ 手续费系数 = 1（不是 2）。证明见 align.py 的 `lag()` 之后那段注释。
 # ══════════════════════════════════════════════════════════════════════
+# METHODS 是【快照】—— 记录它是哪天的数据算出来的。
+# selfcheck 的容差按「距离这个日期的天数」动态放大：
+#   数据每天长 1 根 ⇒ 夏普约漂移 0.0012/天
+#   ⇒ 容差 = max(0.003, 0.0012 × 天数)，上限 0.02
+# 超出容差时跑 `--sync-methods` 一键更新。
+METHODS_ASOF = "2026-10-07"
+
 METHODS = [
-    ("固定版",          None,      14.2,   1.0457, -0.712),
-    ("波动率目标 60%",    0.60,      31.8,   1.3407, -0.525),
-    ("波动率目标 40%",    0.40,      47.7,   1.3453, -0.377),
-    ("波动率目标 25%",    0.25,      76.3,   1.3442, -0.248),
-    ("波动率目标 15%",    0.15,     127.1,   1.3442, -0.154),
+    ("固定版",             None,      14.2,     1.0460, -0.712),
+    ("波动率目标 60%",       0.6,       31.8,     1.3411, -0.525),
+    ("波动率目标 40%",       0.4,       47.7,     1.3457, -0.377),
+    ("波动率目标 25%",       0.25,      76.3,     1.3446, -0.248),
+    ("波动率目标 15%",       0.15,      127.1,    1.3446, -0.154),
 ]
 
 # ── 固定版的回撤随杠杆变（同一策略，只缩放仓位，夏普不变但回撤变）──
-# 实测 ETHUSDT 回测样本 2445 天，扣成本+资金费（手续费系数 1）。
+# 实测 ETHUSDT 回测样本见 SAMPLE_DAYS，扣成本+资金费（手续费系数 1）。
 # 用于按【实际杠杆】报回撤。改动时用 --selfcheck 的 ④ 段核对。
 #
 # ⚠️ 2026-10-06 说明：这组数一度被"修正"成 -0.469/-0.557/-0.636/-0.719/-0.787/-0.890，
@@ -779,10 +786,21 @@ def run(a):
 
     bars, fixed, st = refresh(bn)
     bars, note = complete_bars(bars)
+    # ⚠️ 数据连续性检查（2026-10-07 加）——
+    #    波动率窗口内若漏掉一天大跌，波动率会虚低 ⇒ 仓位偏大 ⇒ 过度杠杆。
+    #    这是唯一指向【危险方向】的失效，所以必须显式拦住。
+    gaps, gapnote = check_bar_continuity(bars)
+    gap_in_win = any(
+        (b["t"] - a["t"]) / 3600000.0 > 25.0
+        for i, (a, b) in enumerate(zip(bars, bars[1:]))
+        if i >= max(0, len(bars) - VOL_WINDOW - 2))
     sig = signal_of(bars)
     if sig is None:
         A("=" * 78)
-        A(f"  {SYM} MA{MA_WINDOW} 固定仓位信号")
+        A(f"  {SYM} MA{MA_WINDOW} 趋势信号  "
+          f"[V2: {VOL_WINDOW}日波动"
+          + (f" + {TARGET_VOL_OVERRIDE*100:g}%档" if TARGET_VOL_OVERRIDE else "")
+          + "]")
         A("=" * 78)
         A("")
         A(f"  ⛔ 数据不足，无法出信号")
@@ -796,7 +814,10 @@ def run(a):
     price = float(bn.fapi("/fapi/v1/ticker/price", {"symbol": SYM}, signed=False)["price"])
 
     A("=" * 78)
-    A(f"  {SYM} MA{MA_WINDOW} 固定仓位信号    {now:%Y-%m-%d %H:%M:%S}")
+    A(f"  {SYM} MA{MA_WINDOW} 趋势信号  "
+      f"[V2: {VOL_WINDOW}日波动"
+      + (f" + {TARGET_VOL_OVERRIDE*100:g}%档" if TARGET_VOL_OVERRIDE else "")
+      + f"]    {now:%Y-%m-%d %H:%M:%S}")
     A("=" * 78)
     A("")
 
@@ -804,6 +825,19 @@ def run(a):
     A("  体检")
     A("  " + "-" * 74)
     A(f"  [数据] {note}")
+    # ⚠️ 连续性检查结果（窗口内缺口 = 危险方向）
+    if gaps:
+        if gap_in_win:
+            A(f"  [数据] 🔴 {gapnote}")
+            A("          ⇒ 波动率可能虚低 ⇒ 仓位偏大 ⇒ 请先跑 --rebuild 重建缓存")
+            for t0, t1, dh in gaps[:3]:
+                d0 = dt.datetime.fromtimestamp(t0 / 1000, dt.UTC)
+                d1 = dt.datetime.fromtimestamp(t1 / 1000, dt.UTC)
+                A(f"             {d0:%Y-%m-%d} → {d1:%Y-%m-%d}（隔 {dh:.0f} 小时）")
+        else:
+            A(f"  [数据] ⚠️ {gapnote}")
+    else:
+        A(f"  [数据] ✅ {gapnote}")
     _last_d = dt.datetime.fromtimestamp(bars[-1]["t"] / 1000, dt.UTC)
     if fixed:
         for t, c0, c1 in fixed:
@@ -956,7 +990,19 @@ def run(a):
                 A(f"     到 {nx[2]:.1f} USDT 可升级到「{nx[0]}」"
                   f"（还差 {adv['gap']:,.2f} U）—— 夏普 {nx[3]:.3f}，回撤 {nx[4]*100:.1f}%")
             else:
-                A(f"     已是最高档（回撤最小的一版）")
+                # ⚠️ 2026-10-07：V2 默认锁 60% 档，而 60% 是【风险最高】的一档
+                #    （回撤 −52.5%），不是"回撤最小"。原文案在强制档位下误导。
+                if TARGET_VOL_OVERRIDE is not None:
+                    _m = [x for x in METHODS
+                          if x[1] == TARGET_VOL_OVERRIDE] or [METHODS[1]]
+                    A(f"     ⚠️ 已锁定 {TARGET_VOL_OVERRIDE*100:g}% 档"
+                      f"（不会自动升档）")
+                    A(f"        · 这是【风险最高、收益也最高】的一档"
+                      f"（回撤约 {abs(_m[0][4])*100:.1f}%）")
+                    A(f"        · 想降风险用 --target-vol 25 或 15"
+                      f"（但年化会大幅下降）")
+                else:
+                    A(f"     已是最高档（回撤最小的一版）")
             A("")
             if adv["target_vol"] is None:
                 A(f"  目标仓位 = max(1.0, {MIN_NOTIONAL:.0f} ÷ {eq:,.2f}) "
@@ -1275,6 +1321,65 @@ def history():
         print(f"    ⇒ 样本还太小，这些数字暂时没有判断力")
 
 
+def sync_methods():
+    """
+    把 METHODS 表更新为当前实算值，并把 METHODS_ASOF 改成今天。
+
+    ⚠️ 只在 --selfcheck 报「超容差」时跑 —— 它会把当前值写成新基准。
+       口径必须与 selfcheck / run() 完全一致：
+         · complete_bars() 过滤掉未走完的当天（否则前视）
+         · align.panel 算净收益（含手续费与资金费）
+    """
+    import re as _re
+    try:
+        sys.path.insert(0, str(pathlib.Path(__file__).parent))
+        from align import max_dd as _mdd
+        from align import panel as _panel
+        from align import sharpe as _sh
+    except ImportError as e:
+        print(f"  ❌ 找不到 align.py：{e}")
+        return
+    raw = json.loads(CACHE.read_text(encoding="utf-8"))
+    raw, note = complete_bars(raw)              # ⚠️ 必须过滤，否则前视
+    C = np.array([b["c"] for b in raw], float)
+    fd = json.loads(FUND.read_text(encoding="utf-8"))
+    fday = {}
+    for x in fd:
+        k = int(x["t"] // 86400000)
+        fday[k] = fday.get(k, 0.0) + x["rate"]
+    day = np.array([b["t"] // 86400000 for b in raw])
+    FR = np.array([fday.get(int(day[i]), 0.0) for i in range(len(C))])
+    P = _panel(C, FR, FEE_PER_SIDE)
+    W = 60
+    rows = []
+    for name, tv, need, _, _ in METHODS:
+        x = P.net(tv, lev=(LEVERAGE if tv is None else None))[W:]
+        x = x[np.isfinite(x)]
+        sh, dd = _sh(x), _mdd(x)
+        w = P.weight(tv)[W:]
+        on = w[w > 0]
+        newneed = need if tv is None else round(20.0 / np.percentile(on, 10), 1)
+        rows.append((name, tv, newneed, round(sh, 4), round(dd, 3)))
+    lines = ["METHODS = ["]
+    for name, tv, need, sh, dd in rows:
+        tvs = "None" if tv is None else f"{tv}"
+        lines.append(f'    ("{name}",{" " * max(1, 16 - len(name))}{tvs},'
+                     f'{" " * max(1, 10 - len(tvs))}{need:.1f},'
+                     f'{" " * max(1, 9 - len(f"{need:.1f}"))}{sh:.4f}, {dd:.3f}),')
+    lines.append("]")
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
+    src = _re.sub(r"METHODS = \[.*?\n\]", "\n".join(lines), src, count=1,
+                  flags=_re.S)
+    today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
+    src = _re.sub(r'METHODS_ASOF = "[^"]*"', f'METHODS_ASOF = "{today}"', src,
+                  count=1)
+    pathlib.Path(__file__).write_text(src, encoding="utf-8")
+    print(f"  ✅ METHODS 已更新（{note}）")
+    for name, tv, need, sh, dd in rows:
+        print(f"     {name:<18} 门槛 {need:>6.1f}U  夏普 {sh:.4f}  回撤 {dd:.3f}")
+    print(f"  ✅ METHODS_ASOF → {today}")
+
+
 def selfcheck():
     """
     自检：确认 METHODS 表里的数字和当前代码/数据一致，
@@ -1303,6 +1408,11 @@ def selfcheck():
         k = int(x["t"] // 86400000)
         fday[k] = fday.get(k, 0.0) + x["rate"]
     raw = json.loads(CACHE.read_text(encoding="utf-8"))
+    # ⚠️ 必须与 run() 走同一条过滤（2026-10-07 修）
+    #    原来这里直接用全部 K 线 ⇒ 含【未走完的当天】⇒ 前视。
+    #    实测影响：60% 档夏普 1.34111（正确）vs 1.31566（前视）
+    #    ⇒ 会让 selfcheck 对正确的 METHODS 表报"超容差"假警报。
+    raw, _cb_note = complete_bars(raw)
     C = np.array([b["c"] for b in raw], float)
     day = np.array([b["t"] // 86400000 for b in raw])
     FR = np.array([fday.get(int(day[i]), 0.0) for i in range(len(C))])
@@ -1338,13 +1448,21 @@ def selfcheck():
         #    夏普会随之漂移（实测约 0.001/天）。
         #    故意放到 ±0.003（约 3 天漂移）——
         #    真出错时偏差会是 0.01+ 量级，不会被漏掉。
-        flag = "" if (abs(d_sh) < 0.003 and abs(d_dd) < 0.005) else "  ⚠️"
+        # 容差按快照年龄动态放大
+        try:
+            _asof = dt.datetime.strptime(METHODS_ASOF, "%Y-%m-%d").replace(
+                tzinfo=dt.UTC)
+            _age = max(0, (dt.datetime.now(dt.UTC) - _asof).days)
+        except Exception:
+            _age = 0
+        _tol_sh = min(0.02, max(0.003, 0.0012 * _age))
+        flag = "" if (abs(d_sh) < _tol_sh and abs(d_dd) < 0.005) else "  ⚠️"
         if flag:
             bad += 1
         print(f"     {name:<18}{t_sh:>10.3f}{r_sh:>9.3f}{d_sh:>+8.3f}"
               f"{t_dd*100:>9.1f}%{r_dd*100:>8.1f}%{d_dd*100:>+7.1f}pp{flag}")
-    print("     │ 容差：夏普 ±0.003，回撤 ±0.5pp（数据日增会漂移，约 0.001/天）")
-    print("     │ ✅ 2026-10-06 起两列都是 0.0 差 —— 系数 1 口径下完全对齐")
+    print(f"     │ 容差：夏普 ±{_tol_sh:.4f}（快照 {METHODS_ASOF}，已 {_age} 天 × 0.0012/天），回撤 ±0.5pp")
+    print(f"     │ {'✅ 全部在容差内' if bad == 0 else f'⚠️ {bad} 处超容差 —— 跑 --sync-methods 更新 METHODS'}")
 
     # ③ 门槛核对
     print()
@@ -1449,6 +1567,8 @@ def main():
                     help="核对 METHODS/DD_BY_LEV 表和实算是否一致 + 对齐自检")
     ap.add_argument("--rebuild", action="store_true",
                     help="从 API 全量重建日线缓存（缓存损坏时自动触发，也可手动跑）")
+    ap.add_argument("--sync-methods", action="store_true",
+                    help="把 METHODS 表更新为当前实算值（--selfcheck 报超容差时跑）")
     ap.add_argument("--target-vol", type=float, default=None, metavar="N",
                     help="强制目标波动率档位（15/25/40），不填=按权益自动选"
                          "（权益越大自动越保守，定投时会被锁死在 15%%）")
@@ -1457,6 +1577,9 @@ def main():
     if a.rebuild:
         from binance_api import BN as _BN
         load_cache(_BN(), rebuild=True)
+        return
+    if a.sync_methods:
+        sync_methods()
         return
     global TARGET_VOL_OVERRIDE
     # V2：默认锁定 60% 档（不给 --target-vol 时）
