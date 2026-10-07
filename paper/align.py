@@ -181,44 +181,46 @@ class panel:
     # ⚠️ cap 的默认值用工具里的 MAX_POS（≈2.995507），不是硬编码 3.0 ——
     #    顶格 w=3.0 时逐仓保证金 = 100% 权益 + 手续费 > 权益 ⇒ 开不出来。
     def weight(self, tv=None, lev=1.405, cap=None, vol_cap="auto",
-               vol_lag=0):
+               vol_lag=0, sig_lag=1):
         """
         目标仓位（占权益倍数）。
 
-        ⚠️ vol_lag（2026-10-07 #4 修正）—— 决定波动率用哪一天：
-             vol_lag=1：w[i] = sig[i-1] × f(vol[i-1])   ← 旧回测口径
-                        （比实盘早一天 ⇒ 回测偏乐观）
-             vol_lag=0：w[i] = sig[i-1] × f(vol[i])     ← 匹配实盘（默认）
+        ⚠️ 两个对齐参数（2026-10-07 #4 + 回归修复）—— 分别控制两个量：
 
-        为什么 vol_lag=0 才对：
-            实盘在 UTC 00:05 跑时，comp[-1] 是【刚收盘的那根】，
-            realized_vol 用的是 r[i-10..i-1] ⇒ 正是 self.vol[i]。
-            而 self.vol[i] = std(r[i-10:i]) 不含 r[i] ⇒ 无前视。
+          sig_lag=1（默认，正确）：趋势信号用【上一根收盘】判定的
+             sig_lag=0（前视，只用于对照）：用【当根收盘】判定
+             ⇒ 前者实盘可得，后者用到当天收盘价
+
+          vol_lag=0（默认，匹配实盘）：波动率用 std(r[i-win:i])
+             vol_lag=1（旧回测口径）：用 std(r[i-win-1:i-1])，早一天
+
+        正确组合 = sig_lag=1 + vol_lag=0   ← 实盘会得到的
+        前视组合 = sig_lag=0 + vol_lag=0   ← net_lookahead() 用
 
         tv=None → 固定 lev；vol_cap='auto' → 用工具里的 VOL_CAP。
         """
+        s_ = lag(self.sig) if sig_lag == 1 else self.sig
         if tv is None:
-            return np.nan_to_num(lag(self.sig) * lev) if vol_lag == 0 else \
-                np.nan_to_num(self.sig * lev)
+            w_fix = s_ * lev
+            return np.nan_to_num(lag(w_fix) if vol_lag != 0 else w_fix)
         if cap is None:
             cap = MAX_POS
         vc = VOL_CAP if vol_cap == "auto" else vol_cap
         if vol_lag == 0:
-            # sig 滞后一天，vol 用当根 —— 两者分别对齐
             vol = self.vol
-            s_ = lag(self.sig)
+            s_v = s_
         else:
-            # 旧口径：vol 不动，由 net() 统一 lag
-            # ⇒ lag(sig × f(vol))[i] = sig[i-1] × f(vol[i-1])  ✅
+            # 旧口径：vol 与 sig 一起退一天（由 net() 补 lag）
             vol = self.vol
-            s_ = self.sig
+            s_v = self.sig if sig_lag == 1 else self.sig
         raw = np.where(np.isfinite(vol) & (vol > 1e-9),
                        tv / np.where(vol > 1e-9, vol, 1.0), 0.0)
         if vc is not None:
             raw = np.where(vol > vc, 0.0, raw)      # 波动率过高 ⇒ 空仓
-        return np.nan_to_num(s_ * np.clip(raw, 0, cap))
+        return np.nan_to_num(s_v * np.clip(raw, 0, cap))
 
-    def net(self, tv=None, lev=1.405, warmup=0, vol_cap="auto", vol_lag=0):
+    def net(self, tv=None, lev=1.405, warmup=0, vol_cap="auto", vol_lag=0,
+            sig_lag=1):
         """
         返回对齐正确的净收益序列（长度 n，前 warmup 项为 0）。
         调用方自己切 [warmup:]。
@@ -226,7 +228,8 @@ class panel:
         ⚠️ vol_lag=0（默认）⇒ weight() 已内含 sig 滞后，这里【不再 lag】。
            vol_lag=1 ⇒ 旧口径，weight() 不含滞后，这里补一次 lag。
         """
-        w = self.weight(tv, lev, cap=None, vol_cap=vol_cap, vol_lag=vol_lag)
+        w = self.weight(tv, lev, cap=None, vol_cap=vol_cap, vol_lag=vol_lag,
+                        sig_lag=sig_lag)
         if vol_lag != 0:
             w = lag(w)                       # 旧口径才需要补滞后
         turn = np.abs(np.diff(np.concatenate([[0.0], w])))
@@ -239,9 +242,16 @@ class panel:
     def net_lookahead(self, tv=None, lev=1.405):
         """
         ⚠️ 只用于对照演示/诊断，严禁用于任何结论。
-        这就是那个让夏普虚高 2.3~2.7 倍的错误写法。
+
+        这就是那个让夏普虚高 2.3~2.7 倍的错误写法：
+            w[i] = sig[i] × f(vol[i])      ← 用【当天收盘】决定当天仓位
+
+        ⚠️ 2026-10-07 回归修复：原来这里调 self.weight(tv, lev)，
+           而 weight 默认 sig_lag=1 已经滞后了 sig ⇒ 两者权重完全相同
+           ⇒ 比值退化成 1.00x，检测器【失效】。
+           现在显式用 sig_lag=0（不滞后）才会得到真正的前视值。
         """
-        w = self.weight(tv, lev)
+        w = self.weight(tv, lev, vol_lag=0, sig_lag=0)
         turn = np.abs(np.diff(np.concatenate([[0.0], w])))
         return w * self.r - turn * self.fee - w * self.FR
 

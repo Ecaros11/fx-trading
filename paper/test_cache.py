@@ -31,8 +31,67 @@ spec.loader.exec_module(M)
 GOOD_BYTES = REAL.read_bytes()
 GOOD_BARS = json.loads(GOOD_BYTES.decode("utf-8"))
 
-# ══════════════ 临时缓存路径 ══════════════
-TMP = pathlib.Path(tempfile.mkdtemp(prefix="ma50_cache_test_"))
+# ══════════════ 临时缓存路径（带可用性防护）══════════════
+def safe_tmpdir(prefix="ma50_cache_test_"):
+    """
+    返回一个【确定可写且不在工作区内】的临时目录。
+
+    ⚠️ 2026-10-07 审计回归修复：原来直接 tempfile.mkdtemp()，
+       但如果 $TEMP/$TMP 指向不可写的路径，Python 会【回退到 CWD】
+       ⇒ 临时目录被建在仓库里 ⇒ PermissionError + finally 的 rmtree 也失败
+       ⇒ 留下 ACL 受限的空目录，并让 git status 报 "Permission denied"。
+
+       这在受限沙箱里真实发生过。所以这里显式防护：
+         ① 检查 gettempdir() 可写
+         ② 检查它不在工作区内
+         ③ 任一不满足 ⇒ 回退到 ~/.ma50_tmp（用户目录，确定可写）
+         ④ 断言最终目录不在工作区内
+    """
+    import os
+    cwd = pathlib.Path.cwd().resolve()
+
+    def _ok(d):
+        try:
+            d = pathlib.Path(d).resolve()
+        except Exception:
+            return None
+        if not d.is_dir() or not os.access(d, os.W_OK):
+            return None
+        # 必须在工作区【之外】
+        try:
+            d.relative_to(cwd)
+            return None            # 在工作区内 ⇒ 不合格
+        except ValueError:
+            return d
+
+    cand = _ok(tempfile.gettempdir())
+    if cand is None:
+        home = pathlib.Path.home() / ".ma50_tmp"
+        try:
+            home.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        cand = _ok(home)
+    if cand is None:
+        print("  ❌ 找不到可用的临时目录（gettempdir 不可写且在工作区内）")
+        print(f"     gettempdir() = {tempfile.gettempdir()}")
+        print(f"     CWD          = {cwd}")
+        print("     ⇒ 请设置 $TEMP 到一个可写、且不在仓库内的目录后重跑")
+        sys.exit(2)
+
+    d = pathlib.Path(tempfile.mkdtemp(prefix=prefix, dir=str(cand)))
+    # 最后再断言一次
+    try:
+        d.resolve().relative_to(cwd)
+        shutil.rmtree(d, ignore_errors=True)
+        print(f"  ❌ 临时目录落在工作区内：{d}")
+        sys.exit(2)
+    except ValueError:
+        pass
+    return d
+
+
+TMP = safe_tmpdir()
 M.CACHE = TMP / "ETHUSDT.json"
 
 
