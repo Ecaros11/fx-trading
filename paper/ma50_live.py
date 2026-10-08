@@ -58,7 +58,21 @@ VOL_CAP = 1.20                 # 已实现波动 > 120% ⇒ 强制空仓（防�
 #    （max(1.0, 20/权益)）。1.405 只是"20 ÷ 14.23"这个历史值的残留，
 #    现在仅作读账户失败时的兜底默认值。
 LEVERAGE = 1.405
-MIN_NOTIONAL = 20.0           # ETHUSDT 实测
+MIN_NOTIONAL = 20.0           # ETHUSDT 实测（币安硬约束：单笔名义 ≥ 20U）
+
+# ⚠️ 2026-10-08 新增：调仓的【软约束】—— 权益的 2%
+#    为什么需要：MIN_NOTIONAL 是【绝对】20U，本金越大它相对越紧：
+#        77U    ⇒ 20U = 26.02% 的仓位（很宽）
+#        1000U  ⇒ 20U =  2.00%（很紧）
+#        10000U ⇒ 20U =  0.20%（等于微调）
+#    ⇒ 本金大时会频繁触发【无意义的微调】
+#      （实测：这些微调只贡献 1.2% 的换手、0.05% 的手续费）
+#    ⇒ 加软约束后，门限 = max(20U, 权益×2%)
+#       1000U 时两者相等；再大时以 2% 为准
+#
+#    ⚠️ 在 77U 下这个约束【不生效】（77×2% = 1.54U < 20U）
+#       ⇒ 行为与之前完全相同，只是让未来本金变大时口径一致
+SOFT_REBALANCE_PCT = 0.02
 MMR = 0.004                   # ETHUSDT 第一档维持保证金率（fapi/v1/leverageBracket 实测）
 
 # ── 强平安全性（关键：要和【单笔逆向】比，不是和【累计回撤】比）──
@@ -713,7 +727,7 @@ def target_position(equity, rvol, method):
            无上限：强平 2 次，最坏逆向 −58.5%，年化 81.4%，夏普 1.234
            上限120%：强平 0 次，最坏逆向 −27.0%，年化 89.8%，夏普 1.321
        ⚠️ 这组是【独立强平模拟】口径（允许仓位突破上限），
-          不等于主表的 align.panel 口径（60% 档：夏普 1.2875、几何 86.2%）。
+          与主表的 align.panel 口径（60% 档：夏普 1.2493、几何 82.1%）是两套不同数字——本表只看强平次数，不比收益。
        ⇒ 避开的是 2021-05-19（当日 10日波动 124.2%，持仓盘中 −58.5%）
        ⇒ 有效区间很宽：90% ~ 130% 都能做到 0 次强平（不是单点拟合）
     """
@@ -803,7 +817,6 @@ def advice(equity, price, rvol=None):
                 "feasible": False, "fail": "bad_price", "threshold": 0.0,
                 "reason": f"价格无效（{price}）"}
     mname, tv, mneed, msr, mdd_tab, nxt, gap = pick_method(equity)
-    forced = TARGET_VOL_OVERRIDE is not None
     pos = target_position(equity, rvol, (mname, tv, mneed, msr, mdd_tab))
     # 低于该版本的最低门槛 → 无论算出什么仓位都开不出来
 
@@ -862,7 +875,35 @@ def advice(equity, price, rvol=None):
 REBALANCE_THRESHOLD = 0.05
 
 
-def decide_action(sig_long, prev_long, tgt_pos, rows):
+def order_decision(equity, price, target_pos, held=None):
+    """
+    统一的「要不要下单」判定 —— 主流程和归档都用这一个，
+    避免两套门限打架（绝对 20U vs 相对 5%）。
+
+    返回 (do_order, dq, minq, tgt_q)
+      do_order : True/False/None（None = 没读到持仓，无法判定）
+      dq       : 建议下单量（数量，带符号；未取整前）
+      minq     : 本次适用的最小下单量（数量）
+      tgt_q    : 目标数量（按步长取整）
+
+    门限 = max(步长, MIN_NOTIONAL/价格, 权益×SOFT_REBALANCE_PCT/价格)
+    """
+    _step = 0.001
+    if not equity or equity <= 0 or not price or price <= 0:
+        return None, 0.0, 0.0, 0.0
+    _soft = SOFT_REBALANCE_PCT * equity / price
+    minq = max(_step, MIN_NOTIONAL / price, _soft)
+    minq = float(np.ceil(minq / _step) * _step)
+    tgt_q = float(np.round(equity * target_pos / price / _step) * _step)
+    if held is None:
+        return None, 0.0, minq, tgt_q
+    _d = tgt_q - held
+    dq = float(np.round(abs(_d) / _step) * _step * (1 if _d > 0 else -1))
+    return bool(abs(dq) >= minq - 1e-9), dq, minq, tgt_q
+
+
+def decide_action(sig_long, prev_long, tgt_pos, rows, do_order=None,
+                   today=None):
     """
     决定归档里的 action。
 
@@ -882,8 +923,24 @@ def decide_action(sig_long, prev_long, tgt_pos, rows):
         return "买入" if sig_long else "卖出"
     if not sig_long:
         return "不动"
+    # ⚠️ 2026-10-08 修复：优先用【主流程的实际判定】——
+    #    原来这里用 REBALANCE_THRESHOLD(5% 相对) 判断，
+    #    而主流程用 MIN_NOTIONAL(20U 绝对) ⇒ 两者会矛盾：
+    #        77U    ⇒ 归档标"调仓" 524 天，实际只需下单 117 天（高估 4.5 倍）
+    #        1000U+ ⇒ 反过来，归档低估（矛盾 A 238~577 天）
+    #    ⇒ 现在以主流程为准（那才是"要不要下单"的真相）
+    if do_order is not None:
+        return "调仓" if do_order else "不动"
+    # 回退路径（没有主流程结果时）：仍用相对门限
     prev_pos = None
     for r in reversed(rows):
+        # ⚠️ 2026-10-08 修复：跳过【当天自己】的行 ——
+        #    重复跑 --archive 时归档里已经有当天那行，
+        #    不跳过的话 prev_pos 会取到自己 ⇒ chg=0 ⇒ 误判「不动」
+        #    （实测：10-07 目标从 2.9955 → 1.8745，应为「调仓(+37%)」，
+        #      但重复跑时输出了「不动」）
+        if today and (r.get("date") or "") == today:
+            continue
         v = (r.get("target_position") or "").strip()
         if v:
             try:
@@ -1179,9 +1236,9 @@ def run(a):
             A(f"  目标数量 = {tgt_n:,.2f} ÷ {price:,.2f} = {adv['qty']:.4f} ETH")
             # ── 币安的下单约束：stepSize 0.001，且名义 ≥ MIN_NOTIONAL ──
             _step = 0.001
-            _minq = max(_step, MIN_NOTIONAL / price)      # 实际最小可下单量
-            _minq = np.ceil(_minq / _step) * _step
-            _tgt_q = np.round(adv["qty"] / _step) * _step
+            # ⚠️ 2026-10-08：改用统一的 order_decision（含软约束）
+            _do, _dq_raw, _minq, _tgt_q = order_decision(
+                eq, price, tgt_pos, held if held is not None else None)
             A(f"  最小名义 = {MIN_NOTIONAL:.0f} USDT"
               f"   ⇒ 最小下单 {_minq:.3f} ETH（步长 {_step}）")
             A(f"  目标数量（按步长取整）= {_tgt_q:.3f} ETH"
@@ -1189,9 +1246,9 @@ def run(a):
             # 若读到持仓，直接给出该买卖多少
             if held is not None:
                 _delta = _tgt_q - held
-                _dq = np.round(abs(_delta) / _step) * _step * (1 if _delta > 0 else -1)
+                _dq = _dq_raw
                 A("")
-                if abs(_dq) < _minq - 1e-9:
+                if not _do:
                     A(f"  现有持仓 {held:.3f} ETH   差额 {_delta:+.4f} ETH")
                     A(f"  ✅ 差额 < 最小下单 {_minq:.3f} ⇒ 【不用动】")
                 else:
@@ -1331,7 +1388,11 @@ def run(a):
         "dist_ma50_pct": f"{sig['dist_pct']:.2f}",
         "signal": "做多" if sig["long"] else "空仓",
         "action": decide_action(sig["long"], sig["prev_long"], tgt_pos,
-                                load_archive()),
+                                load_archive(),
+                                do_order=order_decision(eq, price, tgt_pos,
+                                                        held)[0]
+                                if (eq and price) else None,
+                                today=bd.strftime("%Y-%m-%d")),
         "advice_qty": f"{(eq*tgt_pos/price):.4f}" if eq else "",
         "advice_notional": f"{eq*tgt_pos:.2f}" if eq else "",
         "equity_at_signal": f"{eq:.4f}" if eq else "",
