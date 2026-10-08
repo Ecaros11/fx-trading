@@ -100,8 +100,14 @@ meth = m.METHODS[1]
 # ⚠️ 2026-10-07：上限从硬编码 3.0 改成工具的 MAX_POS
 #    （= n/(1+n·FEE)，因为顶格 3.0 时逐仓开不出来）
 _MP = m.MAX_POS
-CASES = [(0.10, _MP), (0.20, _MP), (0.30, 2.0), (0.60, 1.0),
-         (1.199, 0.60 / 1.199), (1.20, 0.60 / 1.20), (1.201, 0.0),
+# ⚠️ 2026-10-08：target_position 现在会过一遍 feasible_pos
+#    （防 w 落在坏区间（n/(1+n·FEE), n]）
+#    ⇒ 期望值也要过一遍
+_FP = m.feasible_pos
+CASES = [(0.10, _FP(_MP)), (0.20, _FP(_MP)), (0.30, _FP(2.0)),
+         (0.60, _FP(1.0)),
+         (1.199, _FP(0.60 / 1.199)), (1.20, _FP(0.60 / 1.20)),
+         (1.201, 0.0),
          (2.0, 0.0), (0.0, 0.0), (-1.0, 0.0), (float("nan"), 0.0)]
 allok = all(abs(m.target_position(1000.0, rv, meth) - exp) < 1e-9 for rv, exp in CASES)
 chk("target_position 11 组边界全对", allok)

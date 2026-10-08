@@ -30,6 +30,7 @@ MA50 固定仓位 · 可执行工具（ma50_live.py）
 import argparse
 import csv
 import datetime as dt
+import os
 import json
 import pathlib
 import sys
@@ -241,6 +242,26 @@ FIELDS = [
 
 
 # ══════════════════ 数据 ══════════════════
+def _atomic_write(path, text, encoding="utf-8"):
+    """
+    原子写：先写 .tmp，再 os.replace（同一文件系统上的重命名是原子的）。
+
+    ⚠️ 2026-10-08 审计：原来三处直接 path.write_text(...)，
+       写入中途被 Ctrl-C / 断电 / SIGKILL 打断会留下【截断的 JSON】。
+       虽然 load_cache 能自愈（检测到损坏 ⇒ 全量重建），
+       但那要 ~25 秒 + 需要网络；网络不通时工具就不可用了。
+       ⇒ 改成原子写后，要么是旧文件、要么是新文件，不会是半个。
+
+    os.replace 在 Windows 上也是原子的（同一卷内重命名）。
+    """
+    import os as _os
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding=encoding)
+    _os.replace(tmp, path)
+
+
 def complete_bars(bars):
     """丢掉最后一根没走完的日线"""
     if not bars:
@@ -335,7 +356,7 @@ def refresh_funding(bn):
     if add:
         loc.sort(key=lambda x: x["t"])
         FUND.parent.mkdir(parents=True, exist_ok=True)
-        FUND.write_text(json.dumps(loc), encoding="utf-8")
+        _atomic_write(FUND, json.dumps(loc))
     return add, None
 
 
@@ -401,7 +422,7 @@ def load_cache(bn, rebuild=False):
         raise RuntimeError("API 没有返回任何 K 线 —— 检查网络 / 代理 / SYM")
     old.sort(key=lambda r: r["t"])
     CACHE.parent.mkdir(parents=True, exist_ok=True)
-    CACHE.write_text(json.dumps(old), encoding="utf-8")
+    _atomic_write(CACHE, json.dumps(old))
     print(f"  ✅ 缓存已重建：{len(old)} 根"
           f"（{dt.datetime.fromtimestamp(old[0]['t']/1000, dt.UTC):%Y-%m-%d} ~ "
           f"{dt.datetime.fromtimestamp(old[-1]['t']/1000, dt.UTC):%Y-%m-%d}）")
@@ -439,7 +460,7 @@ def refresh(bn):
                 fixed.append((r["t"], old[i]["c"], r["c"]))
             old[i] = r
         old.sort(key=lambda r: r["t"])
-        CACHE.write_text(json.dumps(old), encoding="utf-8")
+        _atomic_write(CACHE, json.dumps(old))
         st["ok"] = True
         # 资金费也要增量更新（原来完全没更新）
         _add, _err = refresh_funding(bn)
@@ -673,7 +694,9 @@ def feasible_pos(w, fee=None):
     if w is None or w <= 0:
         return 0.0
     n_ = max(1, int(np.ceil(w - 1e-9)))
-    if w / n_ + w * f <= 1.0:
+    # ⚠️ 容差 1e-9：MAX_POS 处 lhs 恰好 = 1.0（实测差 1ulp），
+    #    没有容差的话 1ulp 抖动会误砍 0.1% 的仓位。
+    if w / n_ + w * f <= 1.0 + 1e-9:
         return w
     return n_ / (1.0 + n_ * f) * 0.999      # 留 0.1% 余量
 
@@ -696,7 +719,7 @@ def target_position(equity, rvol, method):
     """
     tv = method[1]
     if tv is None:
-        return fixed_position(equity)
+        return feasible_pos(fixed_position(equity))   # 固定版同理：max(1.0, 20/权益) 也可能落在坏区间
     if rvol is None:
         return 0.0
     try:
@@ -707,7 +730,12 @@ def target_position(equity, rvol, method):
     if VOL_CAP is not None and rvol > VOL_CAP:
         return 0.0                     # 波动率过高 ⇒ 空仓
     # ⚠️ 用 MAX_POS 而不是硬编码 3.0 —— 顶格时逐仓开不出来（见上）
-    return float(min(MAX_POS, tv / rvol))
+    w = float(min(MAX_POS, tv / rvol))
+    # ⚠️ 2026-10-08 修复：只做上限截断还不够 ——
+    #    w 也可能落在 (n/(1+n·FEE), n] 这个坏区间里
+    #    （实测 2022-03-21：w=0.9998949 ⇒ ceil=1 ⇒ lhs=1.0003949 ⇒ 开不出来）
+    #    ⇒ 必须过一遍 feasible_pos
+    return feasible_pos(w)
 
 
 def leverage_plan(equity, position, notional):

@@ -57,10 +57,13 @@ def _read_tool_constants():
     # ⚠️ 2026-10-07：#3 仓位上限也要从工具读 ——
     #    顶格时逐仓开不出来（w/ceil(w)+w·FEE>1），工具已改成
     #    MAX_POS = n/(1+n·FEE)；回测必须同步，否则又是"工具 vs 回测"脱节。
-    return mod.VOL_WINDOW, mod.VOL_CAP, mod.MAX_POS
+    # ⚠️ 2026-10-08：feasible_pos 也要读进来 ——
+    #    回测的权重同样可能落在坏区间 (n/(1+n·FEE), n]
+    #    （实测 2022-03-21：w=0.9998949 ⇒ ceil=1 ⇒ lhs=1.0003949 ⇒ 开不出来）
+    return mod.VOL_WINDOW, mod.VOL_CAP, mod.MAX_POS, mod.feasible_pos
 
 
-VOL_WIN, VOL_CAP, MAX_POS = _read_tool_constants()      # 10, 1.20
+VOL_WIN, VOL_CAP, MAX_POS, FEASIBLE_POS = _read_tool_constants()      # 10, 1.20
 
 PY = 365.0
 
@@ -202,7 +205,8 @@ class panel:
         s_ = lag(self.sig) if sig_lag == 1 else self.sig
         if tv is None:
             w_fix = s_ * lev
-            return np.nan_to_num(lag(w_fix) if vol_lag != 0 else w_fix)
+            w_fix = np.nan_to_num(lag(w_fix) if vol_lag != 0 else w_fix)
+            return np.array([FEASIBLE_POS(x) if x > 0 else 0.0 for x in w_fix])
         if cap is None:
             cap = MAX_POS
         vc = VOL_CAP if vol_cap == "auto" else vol_cap
@@ -217,7 +221,10 @@ class panel:
                        tv / np.where(vol > 1e-9, vol, 1.0), 0.0)
         if vc is not None:
             raw = np.where(vol > vc, 0.0, raw)      # 波动率过高 ⇒ 空仓
-        return np.nan_to_num(s_v * np.clip(raw, 0, cap))
+        _w = np.nan_to_num(s_v * np.clip(raw, 0, cap))
+        # ⚠️ 逐元素过 feasible_pos，保证逐仓能真正开出来
+        #    （与工具的 target_position 保持一致）
+        return np.array([FEASIBLE_POS(x) if x > 0 else 0.0 for x in _w])
 
     def net(self, tv=None, lev=1.405, warmup=0, vol_cap="auto", vol_lag=0,
             sig_lag=1):
