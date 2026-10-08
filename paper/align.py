@@ -1,278 +1,203 @@
-"""
-对齐工具（align.py）—— 只此一处定义，避免每个脚本各写一遍再各错一遍
-=================================================================
-事故背景
---------
-2026-10-06：发现所有"仓位 × 收益"的统计都含【前视偏差】。
-错误写法：
+"""Cash-flow backtest using the same MA50 decisions and order constraints as live.
 
-    r = np.zeros(n)
-    r[1:] = C[1:] / C[:-1] - 1      # 前面垫 0 补长度，方便切片
-    net = w * r                     # 🔴 w[i] 配 r[i]
-
-    w[i] = sig(收盘[i])             信号在 i 收盘才知道
-    r[i] = C[i]/C[i-1] - 1          i-1 → i 的收益（i 收盘时已经走完）
-
-    ⇒ 拿"今天收盘才知道的信号"去赚"今天已经涨完的行情"
-
-后果（实测）：夏普虚高 2.3~2.7 倍、回撤减半、年化虚高到 526%（真值 65.5%）。
-
-正确写法
---------
-在第 i 根收盘算出 sig[i]，持有到第 i+1 根收盘：
-
-    ret[i] = w[i-1] × (C[i]/C[i-1] - 1)
-
-常见正确写法（无需垫 0）：
-
-    r  = np.diff(C) / C[:-1]        # 长度 n-1，r[i] = C[i] → C[i+1]
-    w_ = w[:-1]                     # 长度 n-1，w_[i] = sig(收盘[i])
-    net = w_ * r                    # ✅ 对齐
-
-用法
-----
-    from align import lag, panel
-
-    p = panel(C, FR)                # 统一算好所有对齐的序列
-    net = p.w_lag(tv=0.40) * p.r - ...
+The first funding settlement at a UTC daily boundary belongs to the position
+held before the daily rebalance. Trade price defaults to the daily open; this
+is a price approximation, not an intraday liquidation or real-fill simulator.
 """
 import numpy as np
+from ma50_core import (MA_WINDOW, VOL_WINDOW, VOL_CAP, TARGET_VOL, FEE, SOFT_REBALANCE,
+                       ExchangeRules, PositionState, plan_order, strategy_position, decimal, validate_funding)
 
-# ══════════════════════════════════════════════════════════════════════
-#  ⚠️ 这两个常量必须与 ma50_live.py 完全一致
-#     否则 --selfcheck 会拿"20 日窗口的策略"去对比"10 日窗口的表格"，
-#     报出一堆假警报，而真正的口径不一致反而检测不到。
-#
-#  2026-10-07 修：这两个常量以前是硬编码的 20 / 无上限，
-#     工具改成 10 日 + VOL_CAP 后 align.py 没跟着改 —— 结构性缺陷。
-#     现在改成从 ma50_live.py 直接读取，杜绝再次漂移。
-# ══════════════════════════════════════════════════════════════════════
-def _read_tool_constants():
-    import importlib.util
-    import pathlib
-    p = pathlib.Path(__file__).with_name("ma50_live.py")
-    spec = importlib.util.spec_from_file_location("_ml_const", p)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    # ⚠️ 2026-10-07：#3 仓位上限也要从工具读 ——
-    #    顶格时逐仓开不出来（w/ceil(w)+w·FEE>1），工具已改成
-    #    MAX_POS = n/(1+n·FEE)；回测必须同步，否则又是"工具 vs 回测"脱节。
-    # ⚠️ 2026-10-08：feasible_pos 也要读进来 ——
-    #    回测的权重同样可能落在坏区间 (n/(1+n·FEE), n]
-    #    （实测 2022-03-21：w=0.9998949 ⇒ ceil=1 ⇒ lhs=1.0003949 ⇒ 开不出来）
-    return mod.VOL_WINDOW, mod.VOL_CAP, mod.MAX_POS, mod.feasible_pos
-
-
-VOL_WIN, VOL_CAP, MAX_POS, FEASIBLE_POS = _read_tool_constants()      # 10, 1.20
-
+DAY = 86_400_000
 PY = 365.0
 
 
 def lag(w):
-    """把仓位序列滞后一天：lag(w)[i] = w[i-1]（首项补 0）"""
     w = np.asarray(w, float)
-    return np.concatenate([[0.0], w[:-1]])
-
-
-# ──────────────────────────────────────────────────────────────────
-# ⚠️ 手续费系数 = 1，不是 2。不要再改回去。
-# ──────────────────────────────────────────────────────────────────
-# 2026-10-06：这里原来写的是 `turn * self.fee * 2`，多算了一倍手续费。
-# 证据（显式现金流，权益 100U，一个完整往返 0 → 1.405 → 0）：
-#
-#     t1 买入  w=1.405  成交额 140.500  手续费 0.0703
-#     t3 卖出  w=0.000  成交额 140.500  手续费 0.0703
-#     实际合计 = 0.1405 U
-#
-#     |Δw| 之和 = |1.405−0| + |0−1.405| = 2.810
-#     系数 1：2.810 × 100 × 0.0005     = 0.1405  ✅ 与现金流一致
-#     系数 2：2.810 × 100 × 0.0005 × 2 = 0.2810  ❌ 重复计算
-#
-# ⇒ |Δw| 的【和】已经等于"买入成交额 + 卖出成交额"之和（以权益为单位）。
-#   再乘 2 就是把手续费算两遍。
-#
-# 交叉验证：文档 §3.1 写"换手 18.5 次/年 × 1.405 × 0.0005 = 1.30%/年"，
-#          那个 1.30% 是系数 1 的结果；系数 2 会得到 2.60%，与文档矛盾。
-# ──────────────────────────────────────────────────────────────────
+    return np.r_[0.0, w[:-1]]
 
 
 def daily_ret(C):
-    """
-    日收益，与 lag(sig) 对齐。
-    返回长度 n 的数组，ret[i] = C[i]/C[i-1] - 1（ret[0] = 0）。
-    ⚠️ 只能配 lag(仓位) 使用。直接配未滞后的仓位就是前视。
-    """
     C = np.asarray(C, float)
-    r = np.zeros(len(C))
-    r[1:] = C[1:] / C[:-1] - 1
-    return r
+    if len(C) and (not np.isfinite(C).all() or np.any(C <= 0)):
+        raise ValueError("收盘价必须为正且有限")
+    return np.r_[0.0, np.diff(C) / C[:-1]] if len(C) else np.array([])
 
 
 def sma(x, k):
     x = np.asarray(x, float)
-    o = np.full(len(x), np.nan)
+    out = np.full(len(x), np.nan)
     if len(x) >= k:
-        cs = np.cumsum(np.insert(x, 0, 0.0))
-        o[k - 1:] = (cs[k:] - cs[:-k]) / k
-    return o
+        cs = np.cumsum(np.r_[0.0, x])
+        out[k - 1:] = (cs[k:] - cs[:-k]) / k
+    return out
 
 
-def realized_vol(r, i, win=None):
-    """
-    截至第 i-1 根收盘的年化已实现波动（不含当期收益 ⇒ 无前视）。
-    r 必须是 daily_ret(C) 的结果。
-
-    win=None ⇒ 用 VOL_WIN（从 ma50_live.py 读，V2 = 10 日）
-    """
-    if win is None:
-        win = VOL_WIN
-    if i < win + 1:
-        return np.nan
-    w = r[i - win:i]
-    if len(w) < 2:
-        return np.nan
-    return float(w.std(ddof=1) * np.sqrt(PY))
+def realized_vol(r, i, win=VOL_WINDOW):
+    values = np.asarray(r, float)[i - win:i]
+    return float(values.std(ddof=1) * np.sqrt(PY)) if i >= win + 1 else np.nan
 
 
 def sharpe(x, ann=PY):
     x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    if len(x) < 30 or x.std() == 0:
-        return np.nan
-    return x.mean() / x.std() * np.sqrt(ann)
+    if not len(x) or not np.isfinite(x).all():
+        raise ValueError("收益序列缺失或有非有限值")
+    return float(x.mean() / x.std() * np.sqrt(ann)) if x.std() else 0.0
 
 
 def max_dd(x):
-    x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    eq = np.cumprod(1 + x)
-    return float((eq / np.maximum.accumulate(eq) - 1).min())
+    eq = np.r_[1.0, np.cumprod(1 + np.asarray(x, float))]
+    return float(np.min(eq / np.maximum.accumulate(eq) - 1))
 
 
 def cagr(x, ann=PY):
     x = np.asarray(x, float)
-    x = x[np.isfinite(x)]
-    eq = np.cumprod(1 + x)
-    if eq[-1] <= 0:
-        return -1.0
-    return float(eq[-1] ** (ann / len(x)) - 1)
+    if not len(x):
+        raise ValueError("收益序列为空")
+    end = float(np.prod(1 + x))
+    return end ** (ann / len(x)) - 1 if end > 0 else -1.0
+
+
+def simulate(bars, funding, target_vol=TARGET_VOL, initial_equity=1000.0,
+             fee=FEE, warmup=60, rules=None, constrained=False,
+             slippage=0.0, fixed_lev=None, contributions=None, price_buffer=0.0,
+             vol_window=VOL_WINDOW, soft_pct=SOFT_REBALANCE, rebalance_both=True,
+             funding_interval_hours=8):
+    n = len(bars)
+    if n <= warmup or not np.isfinite([initial_equity, fee, slippage]).all() or initial_equity < 0 or fee < 0 or slippage < 0:
+        raise ValueError("回测参数或样本长度无效")
+    if isinstance(vol_window, bool) or not isinstance(vol_window, (int, np.integer)) or vol_window < 2 or warmup < max(MA_WINDOW, vol_window + 1):
+        raise ValueError("波动窗口必须为至少2日的整数，预热期必须覆盖信号与波动窗口")
+    cash = np.zeros(n) if contributions is None else np.asarray(contributions, dtype=float)
+    if cash.shape != (n,) or not np.isfinite(cash).all() or np.any(cash < 0) or np.any(cash[:warmup] != 0):
+        raise ValueError("定投入金必须与日线等长、非负有限，且不在预热期入金")
+    if initial_equity == 0 and cash[warmup] <= 0:
+        raise ValueError("零初始本金需要在首个回测日入金")
+    C = np.array([b['c'] for b in bars], float)
+    O = np.array([b.get('o', C[max(0, i-1)]) for i, b in enumerate(bars)], float)
+    if not np.isfinite(C).all() or not np.isfinite(O).all() or np.any(C <= 0) or np.any(O <= 0):
+        raise ValueError("回测价格无效")
+    times = np.array([int(b['t']) for b in bars])
+    if any(isinstance(b["t"], bool) or float(b["t"]) != int(b["t"]) for b in bars) or np.any(times % DAY) or np.any(np.diff(times) != DAY):
+        raise ValueError("回测日线不连续、有重复或倒序")
+    r = daily_ret(C); average = sma(C, MA_WINDOW)
+    vols = np.full(n, np.nan)
+    for i in range(vol_window + 1, n):
+        vols[i] = realized_vol(r, i, win=vol_window)
+    funding = validate_funding(funding, int(times[warmup]), int(times[-1])+DAY, funding_interval_hours)
+    events = {}
+    seen = set()
+    for event in funding:
+        t = int(event['t']); rate = float(event['rate'])
+        if t in seen or not np.isfinite(rate):
+            raise ValueError("资金费有重复或无效记录")
+        seen.add(t); events.setdefault(t // DAY, []).append(event)
+    if rules is None:
+        rules = ExchangeRules()
+    equity = float(initial_equity); held = 0.0
+    net = np.zeros(n); equities = np.full(n, equity)
+    quantities = np.zeros(n); fees = np.zeros(n); funding_cost = np.zeros(n)
+    targets = np.zeros(n); actions = []
+    for i in range(warmup, n):
+        equity += cash[i]
+        before = equity  # Start-of-day deposits are capital, never trading return.
+        equity += held * (O[i] - C[i-1])
+        daily_events = sorted(events.get(int(times[i] // DAY), []), key=lambda e:e['t'])
+        if not daily_events:
+            raise ValueError(f"资金费缺少日期 {int(times[i] // DAY)}，禁止按零费用回测")
+        boundary, later = [], []
+        for event in daily_events:
+            (boundary if event['t'] - times[i] < 60_000 else later).append(event)
+        for event in boundary:
+            mark = float(event.get('markPrice') or O[i])
+            cost = held * mark * float(event['rate'])
+            equity -= cost; funding_cost[i] += cost
+        if equity <= 0:
+            net[i] = -1; equities[i:] = 0; break
+        trend = bool(C[i-1] > average[i-1])
+        if fixed_lev is None:
+            weight, reason = strategy_position(trend, vols[i], equity, target_vol,
+                                               fee + slippage, VOL_CAP, rules.min_notional)
+        else:
+            weight = min(fixed_lev, 3 / (1 + 3 * (fee + slippage))) if trend and vols[i] <= VOL_CAP else 0
+            reason = "in_market" if weight else "off"
+        targets[i] = weight
+        available = max(0, equity - held * O[i] / 3)
+        plan = plan_order(equity, O[i], weight, PositionState(long_qty=held), rules,
+                          available, fee + slippage, soft_pct=soft_pct, constrained=constrained,
+                          price_buffer=price_buffer, rebalance_both=rebalance_both)
+        if plan.actionable:
+            delta = plan.quantity if plan.side == 'BUY' else -plan.quantity
+            cost = abs(delta) * O[i] * (fee + slippage)
+            equity -= cost; fees[i] = cost
+            held = float(decimal(held) + decimal(delta)) if constrained else held + delta
+            actions.append({'i':i,'side':plan.side,'quantity':plan.quantity,'reason':reason})
+        for event in later:
+            mark = float(event.get('markPrice') or O[i])
+            cost = held * mark * float(event['rate'])
+            equity -= cost; funding_cost[i] += cost
+        equity += held * (C[i] - O[i])
+        equity = max(0, equity)
+        net[i] = equity / before - 1; equities[i] = equity; quantities[i] = held
+        if equity == 0:
+            equities[i:] = 0; break
+    return {'net':net,'equity':equities,'contributions':cash.copy(),'quantity':quantities,'target':targets,
+            'fees':fees,'funding_cost':funding_cost,'actions':actions,
+            'rebalance_policy':'symmetric' if rebalance_both else 'increase_only',
+            'soft_rebalance_pct':soft_pct,'exchange_constraints':constrained,
+            'model':'daily_open_cashflow; midnight funding before rebalance; no liquidation model',
+            'funding_price_approximation':any((not e.get('markPrice') or e.get('markPriceApproximate')) for e in funding if e['t']>=times[warmup])}
 
 
 class panel:
-    """
-    一次算好所有对齐序列，之后所有脚本都用它，不再手写对齐。
-
-    C   收盘价数组
-    FR  每日资金费（多头付为正），长度与 C 相同
-    fee 单边手续费
-    """
-
-    def __init__(self, C, FR, fee=0.0005):
-        self.C = np.asarray(C, float)
-        self.FR = np.asarray(FR, float)
-        self.fee = fee
-        self.n = len(self.C)
-        self.r = daily_ret(self.C)                 # 配 lag(w) 使用
-        self.ma50 = sma(self.C, 50)
-        self.sig = np.nan_to_num((self.C > self.ma50).astype(float))
-        # 已实现波动（滞后，无前视）
-        # ⚠️ 窗口和上限都从 ma50_live.py 读 —— 不要在这里写死
+    """Compatibility adapter. Pass actual bars/funding for event-level accounting."""
+    def __init__(self, C, FR, fee=FEE, bars=None, funding=None):
+        self.C = np.asarray(C, float); self.FR = np.asarray(FR, float)
+        if len(self.C) != len(self.FR) or not np.isfinite(self.FR).all():
+            raise ValueError("资金费和价格长度/数值不匹配")
+        self.n = len(self.C); self.fee = fee
+        self.r = daily_ret(self.C); self.ma50 = sma(self.C, MA_WINDOW)
+        self.sig = (self.C > self.ma50).astype(float)
         self.vol = np.full(self.n, np.nan)
-        for i in range(VOL_WIN + 1, self.n):
-            self.vol[i] = realized_vol(self.r, i, VOL_WIN)
+        for i in range(VOL_WINDOW + 1,self.n):self.vol[i] = realized_vol(self.r,i)
+        self.bars = bars or [{'t':(10957+i)*DAY,'o':float(self.C[max(0,i-1)]),
+                             'c':float(c)} for i,c in enumerate(self.C)]
+        self._actual_funding = funding is not None
+        self.funding = funding if funding is not None else [
+            {'t':b['t']+8*3_600_000,'rate':float(self.FR[i]),'markPrice':float(b['o'])}
+            for i,b in enumerate(self.bars)]
 
-    # ⚠️ cap 的默认值用工具里的 MAX_POS（≈2.995507），不是硬编码 3.0 ——
-    #    顶格 w=3.0 时逐仓保证金 = 100% 权益 + 手续费 > 权益 ⇒ 开不出来。
-    def weight(self, tv=None, lev=1.405, cap=None, vol_cap="auto",
-               vol_lag=0, sig_lag=1):
-        """
-        目标仓位（占权益倍数）。
+    def weight(self,tv=None,lev=1.405,cap=None,vol_cap='auto',vol_lag=0,sig_lag=1):
+        if vol_lag != 0 or sig_lag != 1:
+            raise ValueError("只支持无前视、无额外滞后的权重")
+        result = np.zeros(self.n)
+        for i in range(VOL_WINDOW + 1,self.n):
+            if tv is None:
+                result[i] = lev if self.sig[i-1] and self.vol[i] <= VOL_CAP else 0
+            elif self.vol[i] > 0:
+                result[i] = strategy_position(bool(self.sig[i-1]),self.vol[i],1,tv,self.fee)[0]
+        if cap is not None:result = np.minimum(result,cap)
+        return result
 
-        ⚠️ 两个对齐参数（2026-10-07 #4 + 回归修复）—— 分别控制两个量：
+    def net(self,tv=None,lev=1.405,warmup=60,**kwargs):
+        if kwargs:raise ValueError("已移除可能错位的回测选项")
+        return simulate(self.bars,self.funding,tv,1,self.fee,warmup=warmup,
+                        fixed_lev=lev if tv is None else None,
+                        funding_interval_hours=8 if self._actual_funding else None)['net']
 
-          sig_lag=1（默认，正确）：趋势信号用【上一根收盘】判定的
-             sig_lag=0（前视，只用于对照）：用【当根收盘】判定
-             ⇒ 前者实盘可得，后者用到当天收盘价
-
-          vol_lag=0（默认，匹配实盘）：波动率用 std(r[i-win:i])
-             vol_lag=1（旧回测口径）：用 std(r[i-win-1:i-1])，早一天
-
-        正确组合 = sig_lag=1 + vol_lag=0   ← 实盘会得到的
-        前视组合 = sig_lag=0 + vol_lag=0   ← net_lookahead() 用
-
-        tv=None → 固定 lev；vol_cap='auto' → 用工具里的 VOL_CAP。
-        """
-        s_ = lag(self.sig) if sig_lag == 1 else self.sig
-        if tv is None:
-            w_fix = s_ * lev
-            w_fix = np.nan_to_num(lag(w_fix) if vol_lag != 0 else w_fix)
-            return np.array([FEASIBLE_POS(x) if x > 0 else 0.0 for x in w_fix])
-        if cap is None:
-            cap = MAX_POS
-        vc = VOL_CAP if vol_cap == "auto" else vol_cap
-        if vol_lag == 0:
-            vol = self.vol
-            s_v = s_
-        else:
-            # 旧口径：vol 与 sig 一起退一天（由 net() 补 lag）
-            vol = self.vol
-            s_v = self.sig if sig_lag == 1 else self.sig
-        raw = np.where(np.isfinite(vol) & (vol > 1e-9),
-                       tv / np.where(vol > 1e-9, vol, 1.0), 0.0)
-        if vc is not None:
-            raw = np.where(vol > vc, 0.0, raw)      # 波动率过高 ⇒ 空仓
-        _w = np.nan_to_num(s_v * np.clip(raw, 0, cap))
-        # ⚠️ 逐元素过 feasible_pos，保证逐仓能真正开出来
-        #    （与工具的 target_position 保持一致）
-        return np.array([FEASIBLE_POS(x) if x > 0 else 0.0 for x in _w])
-
-    def net(self, tv=None, lev=1.405, warmup=0, vol_cap="auto", vol_lag=0,
-            sig_lag=1):
-        """
-        返回对齐正确的净收益序列（长度 n，前 warmup 项为 0）。
-        调用方自己切 [warmup:]。
-
-        ⚠️ vol_lag=0（默认）⇒ weight() 已内含 sig 滞后，这里【不再 lag】。
-           vol_lag=1 ⇒ 旧口径，weight() 不含滞后，这里补一次 lag。
-        """
-        w = self.weight(tv, lev, cap=None, vol_cap=vol_cap, vol_lag=vol_lag,
-                        sig_lag=sig_lag)
-        if vol_lag != 0:
-            w = lag(w)                       # 旧口径才需要补滞后
-        turn = np.abs(np.diff(np.concatenate([[0.0], w])))
-        fr = lag(self.FR)
-        net = w * self.r - turn * self.fee - w * fr
-        if warmup:
-            net[:warmup] = 0.0
-        return net
-
-    def net_lookahead(self, tv=None, lev=1.405):
-        """
-        ⚠️ 只用于对照演示/诊断，严禁用于任何结论。
-
-        这就是那个让夏普虚高 2.3~2.7 倍的错误写法：
-            w[i] = sig[i] × f(vol[i])      ← 用【当天收盘】决定当天仓位
-
-        ⚠️ 2026-10-07 回归修复：原来这里调 self.weight(tv, lev)，
-           而 weight 默认 sig_lag=1 已经滞后了 sig ⇒ 两者权重完全相同
-           ⇒ 比值退化成 1.00x，检测器【失效】。
-           现在显式用 sig_lag=0（不滞后）才会得到真正的前视值。
-        """
-        w = self.weight(tv, lev, vol_lag=0, sig_lag=0)
-        turn = np.abs(np.diff(np.concatenate([[0.0], w])))
-        return w * self.r - turn * self.fee - w * self.FR
+    def net_lookahead(self,tv=None,lev=1.405):
+        # Demonstration only; no use in validation or published statistics.
+        w = np.zeros(self.n)
+        for i in range(VOL_WINDOW + 1,self.n):
+            if self.vol[i] > 0:
+                w[i] = strategy_position(bool(self.sig[i]),self.vol[i],1,tv,self.fee)[0] if tv is not None else self.sig[i]*lev
+        return w*self.r-np.abs(np.diff(np.r_[0,w]))*self.fee-w*self.FR
 
 
-def assert_no_lookahead(panel_obj, tv=None, lev=1.405, tol=0.35, warmup=60):
-    """
-    自检：正确口径的夏普必须显著低于前视口径。
-    若两者接近，说明这个脚本又写错了对齐。
-    返回 (正确夏普, 前视夏普)。
-    """
-    a = sharpe(panel_obj.net(tv, lev)[warmup:])
-    b = sharpe(panel_obj.net_lookahead(tv, lev)[warmup:])
-    if not (b > a * (1 + tol)):
-        raise AssertionError(
-            f"对齐检查失败：正确 {a:.3f} / 前视 {b:.3f} —— 比值只有 {b/a:.2f}x，"
-            f"应该 > {1+tol:.2f}x。这个脚本可能又把仓位配到同期收益上了。")
-    return a, b
+def assert_no_lookahead(panel_obj,tv=None,lev=1.405,**kwargs):
+    # Validate causality structurally instead of requiring a higher fake Sharpe.
+    weights = panel_obj.weight(tv,lev)
+    for i in range(60,len(weights)):
+        if not panel_obj.sig[i-1] and weights[i] != 0:
+            raise AssertionError("空仓信号对应非零仓位")
+    return sharpe(panel_obj.net(tv,lev)[60:]),sharpe(panel_obj.net_lookahead(tv,lev)[60:])

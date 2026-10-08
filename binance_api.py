@@ -56,13 +56,15 @@ class BNError(Exception):
 
 
 class BN:
-    def __init__(self, proxy=PROXY, timeout=40, recv_window=60000):
+    def __init__(self, proxy=None, timeout=40, recv_window=60000):
         env = load_env()
         self.key = env.get("BINANCE_KEY") or env.get("BINANCE_API_KEY") or env.get("API_KEY")
         self.secret = (env.get("BINANCE_SECRET") or env.get("BINANCE_API_SECRET")
                        or env.get("SECRET_KEY") or env.get("API_SECRET"))
         if not self.key or not self.secret:
             raise BNError("在 {} 里没找到密钥".format(ENV_PATH))
+        if proxy is None:
+            proxy = env.get("BINANCE_PROXY") or PROXY
         if proxy:
             self.opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
@@ -82,11 +84,11 @@ class BN:
         代理有 ~13 秒的往返延迟，不做这个同步，签名时间戳必然过期 (-1021)。
         """
         try:
+            sent = time.time() * 1000
             r = self._request("GET", FAPI + "/fapi/v1/time", signed=False, _no_sync=True)
             # 简单估计：假设延迟对称，服务器时间大约在 (发出+收到)/2
-            self._offset_ms = 0.0
-            local = time.time() * 1000
-            self._offset_ms = r["serverTime"] - local
+            received = time.time() * 1000
+            self._offset_ms = r["serverTime"] - (sent + received) / 2
             return self._offset_ms
         except Exception:
             self._offset_ms = 0.0
@@ -98,6 +100,8 @@ class BN:
     # ---------------------------------------------------------------- 底层
     def _request(self, method, url, params=None, signed=True, headers=None,
                  _no_sync=False, _retry=True):
+        if method != "GET":
+            raise BNError("此客户端只允许 GET 读取请求")
         params = dict(params or {})
         if signed:
             params["timestamp"] = self._ts()

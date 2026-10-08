@@ -1,0 +1,1475 @@
+﻿{
+  "rows": [
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "14.25019302",
+      "asset": "USDT",
+      "time": 1790906291000,
+      "info": "TRANSFER",
+      "tranId": "416911456170",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04244045",
+      "asset": "USDT",
+      "time": 1790906346000,
+      "info": "8138613146",
+      "tranId": "900318138613146",
+      "tradeId": "8138613146"
+    },
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "-5.88282434",
+      "asset": "USDT",
+      "time": 1790909704000,
+      "info": "TRANSFER",
+      "tranId": "416926505029",
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "0.00000983",
+      "asset": "BTC",
+      "time": 1790910860000,
+      "info": "TRANSFER",
+      "tranId": "416928062827",
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "5.88282434",
+      "asset": "USDT",
+      "time": 1790910904000,
+      "info": "TRANSFER",
+      "tranId": "416930018110",
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "COIN_SWAP_DEPOSIT",
+      "income": "0.83229772",
+      "asset": "USDT",
+      "time": 1790911388000,
+      "info": "COIN_SWAP_DEPOSIT",
+      "tranId": "2372328518841143745",
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "COIN_SWAP_WITHDRAW",
+      "income": "-0.00000983",
+      "asset": "BTC",
+      "time": 1790911388000,
+      "info": "COIN_SWAP_WITHDRAW",
+      "tranId": "2372328518841143745",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0429228",
+      "asset": "USDT",
+      "time": 1790926549000,
+      "info": "8139765981",
+      "tranId": "900308139765981",
+      "tradeId": "8139765981"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.9647",
+      "asset": "USDT",
+      "time": 1790926549000,
+      "info": "8139765981",
+      "tranId": "900308139765981",
+      "tradeId": "8139765981"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04291405",
+      "asset": "USDT",
+      "time": 1790926681000,
+      "info": "8139771023",
+      "tranId": "900318139771023",
+      "tradeId": "8139771023"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04290645",
+      "asset": "USDT",
+      "time": 1790926694000,
+      "info": "8139771497",
+      "tranId": "900308139771497",
+      "tradeId": "8139771497"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.0152",
+      "asset": "USDT",
+      "time": 1790926694000,
+      "info": "8139771497",
+      "tranId": "900308139771497",
+      "tradeId": "8139771497"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04289875",
+      "asset": "USDT",
+      "time": 1790926709000,
+      "info": "8139773372",
+      "tranId": "900308139773372",
+      "tradeId": "8139773372"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00860642",
+      "asset": "USDT",
+      "time": 1790928000000,
+      "info": "FUNDING_FEE",
+      "tranId": "1583124156893556572",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.08355461",
+      "asset": "USDT",
+      "time": 1790956465000,
+      "info": "8814657931",
+      "tranId": "900608814657931",
+      "tradeId": "8814657931"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00103551",
+      "asset": "USDT",
+      "time": 1790956800000,
+      "info": "FUNDING_FEE",
+      "tranId": "1584332118207163652",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00286652",
+      "asset": "USDT",
+      "time": 1790956800000,
+      "info": "FUNDING_FEE",
+      "tranId": "1584332118332992002",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BNBUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.00380565",
+      "asset": "USDT",
+      "time": 1790966649000,
+      "info": "2283935151",
+      "tranId": "903302283935151",
+      "tradeId": "2283935151"
+    },
+    {
+      "symbol": "",
+      "incomeType": "POSITION_CLAIM_TRANSFER",
+      "income": "0.5",
+      "asset": "USDT",
+      "time": 1790966649000,
+      "info": "POSITION_CLAIM_TRANSFER",
+      "tranId": "1158474523131111488",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00386424",
+      "asset": "USDT",
+      "time": 1790985600000,
+      "info": "FUNDING_FEE",
+      "tranId": "1585540077339733852",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00247396",
+      "asset": "USDT",
+      "time": 1790985600000,
+      "info": "FUNDING_FEE",
+      "tranId": "1585540077465562552",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BNBUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00023672",
+      "asset": "USDT",
+      "time": 1790985600000,
+      "info": "FUNDING_FEE",
+      "tranId": "1585540077591392570",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00030511",
+      "asset": "USDT",
+      "time": 1791014400000,
+      "info": "FUNDING_FEE",
+      "tranId": "1586748035801211072",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00015454",
+      "asset": "USDT",
+      "time": 1791014400000,
+      "info": "FUNDING_FEE",
+      "tranId": "1586748035885101282",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BNBUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.00386165",
+      "asset": "USDT",
+      "time": 1791033573000,
+      "info": "2284373332",
+      "tranId": "903312284373332",
+      "tradeId": "2284373332"
+    },
+    {
+      "symbol": "BNBUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.112",
+      "asset": "USDT",
+      "time": 1791033573000,
+      "info": "2284373332",
+      "tranId": "903312284373332",
+      "tradeId": "2284373332"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.08300281",
+      "asset": "USDT",
+      "time": 1791034164000,
+      "info": "8816819500",
+      "tranId": "900618816819500",
+      "tradeId": "8816819500"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "1.1036",
+      "asset": "USDT",
+      "time": 1791034164000,
+      "info": "8816819500",
+      "tranId": "900618816819500",
+      "tradeId": "8816819500"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.09639144",
+      "asset": "USDT",
+      "time": 1791034301000,
+      "info": "8816820168",
+      "tranId": "900618816820168",
+      "tradeId": "8816820168"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0964962",
+      "asset": "USDT",
+      "time": 1791036001000,
+      "info": "8816836885",
+      "tranId": "900608816836885",
+      "tradeId": "8816836885"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.20952",
+      "asset": "USDT",
+      "time": 1791036001000,
+      "info": "8816836885",
+      "tranId": "900608816836885",
+      "tradeId": "8816836885"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.03484584",
+      "asset": "USDT",
+      "time": 1791036046000,
+      "info": "8816837002",
+      "tranId": "900608816837002",
+      "tradeId": "8816837002"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.06165035",
+      "asset": "USDT",
+      "time": 1791036046000,
+      "info": "8816837003",
+      "tranId": "900608816837003",
+      "tradeId": "8816837003"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00384136",
+      "asset": "USDT",
+      "time": 1791043200000,
+      "info": "FUNDING_FEE",
+      "tranId": "1587955994891840902",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00353755",
+      "asset": "USDT",
+      "time": 1791043200000,
+      "info": "FUNDING_FEE",
+      "tranId": "1587955995017669122",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0965772",
+      "asset": "USDT",
+      "time": 1791049041000,
+      "info": "8816963890",
+      "tranId": "900618816963890",
+      "tradeId": "8816963890"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.162",
+      "asset": "USDT",
+      "time": 1791049041000,
+      "info": "8816963890",
+      "tranId": "900618816963890",
+      "tradeId": "8816963890"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.09255729",
+      "asset": "USDT",
+      "time": 1791049047000,
+      "info": "8816963988",
+      "tranId": "900618816963988",
+      "tradeId": "8816963988"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04245695",
+      "asset": "USDT",
+      "time": 1791049468000,
+      "info": "8143682661",
+      "tranId": "900318143682661",
+      "tradeId": "8143682661"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.8836",
+      "asset": "USDT",
+      "time": 1791049468000,
+      "info": "8143682661",
+      "tranId": "900318143682661",
+      "tradeId": "8143682661"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.03490084",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968140",
+      "tranId": "900608816968140",
+      "tradeId": "8816968140"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073872",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968141",
+      "tranId": "900608816968141",
+      "tradeId": "8816968141"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073872",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968142",
+      "tranId": "900608816968142",
+      "tradeId": "8816968142"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073872",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968143",
+      "tranId": "900608816968143",
+      "tradeId": "8816968143"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073872",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968144",
+      "tranId": "900608816968144",
+      "tradeId": "8816968144"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073872",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968145",
+      "tranId": "900608816968145",
+      "tradeId": "8816968145"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.00402702",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968146",
+      "tranId": "900608816968146",
+      "tradeId": "8816968146"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.04835999",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968140",
+      "tranId": "900608816968140",
+      "tradeId": "8816968140"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.01488",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968141",
+      "tranId": "900608816968141",
+      "tradeId": "8816968141"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.01488",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968142",
+      "tranId": "900608816968142",
+      "tradeId": "8816968142"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.01488",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968143",
+      "tranId": "900608816968143",
+      "tradeId": "8816968143"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.01488",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968144",
+      "tranId": "900608816968144",
+      "tradeId": "8816968144"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.01488",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968145",
+      "tranId": "900608816968145",
+      "tradeId": "8816968145"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.00557999",
+      "asset": "USDT",
+      "time": 1791049493000,
+      "info": "8816968146",
+      "tranId": "900608816968146",
+      "tradeId": "8816968146"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01208016",
+      "asset": "USDT",
+      "time": 1791049509000,
+      "info": "8816968309",
+      "tranId": "900608816968309",
+      "tradeId": "8816968309"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.16241104",
+      "asset": "USDT",
+      "time": 1791049509000,
+      "info": "8816968310",
+      "tranId": "900608816968310",
+      "tradeId": "8816968310"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.17459065",
+      "asset": "USDT",
+      "time": 1791049878000,
+      "info": "8816980124",
+      "tranId": "900618816980124",
+      "tradeId": "8816980124"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.1989",
+      "asset": "USDT",
+      "time": 1791049878000,
+      "info": "8816980124",
+      "tranId": "900618816980124",
+      "tradeId": "8816980124"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.16516378",
+      "asset": "USDT",
+      "time": 1791049890000,
+      "info": "8816980659",
+      "tranId": "900618816980659",
+      "tradeId": "8816980659"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.15711871",
+      "asset": "USDT",
+      "time": 1791051042000,
+      "info": "8817004545",
+      "tranId": "900608817004545",
+      "tradeId": "8817004545"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.00805737",
+      "asset": "USDT",
+      "time": 1791051042000,
+      "info": "8817004546",
+      "tranId": "900608817004546",
+      "tradeId": "8817004546"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.02339999",
+      "asset": "USDT",
+      "time": 1791051042000,
+      "info": "8817004545",
+      "tranId": "900608817004545",
+      "tradeId": "8817004545"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.00119999",
+      "asset": "USDT",
+      "time": 1791051042000,
+      "info": "8817004546",
+      "tranId": "900608817004546",
+      "tradeId": "8817004546"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.00939939",
+      "asset": "USDT",
+      "time": 1791051121000,
+      "info": "8817006648",
+      "tranId": "900618817006648",
+      "tradeId": "8817006648"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.09265113",
+      "asset": "USDT",
+      "time": 1791051121000,
+      "info": "8817006649",
+      "tranId": "900618817006649",
+      "tradeId": "8817006649"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.10196426",
+      "asset": "USDT",
+      "time": 1791052930000,
+      "info": "8817023748",
+      "tranId": "900608817023748",
+      "tradeId": "8817023748"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.17252",
+      "asset": "USDT",
+      "time": 1791052930000,
+      "info": "8817023748",
+      "tranId": "900608817023748",
+      "tradeId": "8817023748"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.10065112",
+      "asset": "USDT",
+      "time": 1791053281000,
+      "info": "8817025612",
+      "tranId": "900618817025612",
+      "tradeId": "8817025612"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.100629",
+      "asset": "USDT",
+      "time": 1791053838000,
+      "info": "8817029230",
+      "tranId": "900608817029230",
+      "tradeId": "8817029230"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.04425",
+      "asset": "USDT",
+      "time": 1791053838000,
+      "info": "8817029230",
+      "tranId": "900608817029230",
+      "tradeId": "8817029230"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073664",
+      "asset": "USDT",
+      "time": 1791054962000,
+      "info": "8817038695",
+      "tranId": "900618817038695",
+      "tradeId": "8817038695"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01073664",
+      "asset": "USDT",
+      "time": 1791054962000,
+      "info": "8817038696",
+      "tranId": "900618817038696",
+      "tradeId": "8817038696"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02147328",
+      "asset": "USDT",
+      "time": 1791054962000,
+      "info": "8817038697",
+      "tranId": "900618817038697",
+      "tradeId": "8817038697"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01610496",
+      "asset": "USDT",
+      "time": 1791054962000,
+      "info": "8817038698",
+      "tranId": "900618817038698",
+      "tradeId": "8817038698"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02147328",
+      "asset": "USDT",
+      "time": 1791054962000,
+      "info": "8817038699",
+      "tranId": "900618817038699",
+      "tradeId": "8817038699"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.03623616",
+      "asset": "USDT",
+      "time": 1791054962000,
+      "info": "8817038700",
+      "tranId": "900618817038700",
+      "tradeId": "8817038700"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0107314",
+      "asset": "USDT",
+      "time": 1791055211000,
+      "info": "8817041763",
+      "tranId": "900608817041763",
+      "tradeId": "8817041763"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.06304697",
+      "asset": "USDT",
+      "time": 1791055211000,
+      "info": "8817041764",
+      "tranId": "900608817041764",
+      "tradeId": "8817041764"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0429256",
+      "asset": "USDT",
+      "time": 1791055211000,
+      "info": "8817041765",
+      "tranId": "900608817041765",
+      "tradeId": "8817041765"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.01048",
+      "asset": "USDT",
+      "time": 1791055211000,
+      "info": "8817041763",
+      "tranId": "900608817041763",
+      "tradeId": "8817041763"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.06157",
+      "asset": "USDT",
+      "time": 1791055211000,
+      "info": "8817041764",
+      "tranId": "900608817041764",
+      "tradeId": "8817041764"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.04192",
+      "asset": "USDT",
+      "time": 1791055211000,
+      "info": "8817041765",
+      "tranId": "900608817041765",
+      "tradeId": "8817041765"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.11402155",
+      "asset": "USDT",
+      "time": 1791055214000,
+      "info": "8817041773",
+      "tranId": "900618817041773",
+      "tradeId": "8817041773"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.11393485",
+      "asset": "USDT",
+      "time": 1791055955000,
+      "info": "8817046683",
+      "tranId": "900608817046683",
+      "tradeId": "8817046683"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.1734",
+      "asset": "USDT",
+      "time": 1791055955000,
+      "info": "8817046683",
+      "tranId": "900608817046683",
+      "tradeId": "8817046683"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.07377067",
+      "asset": "USDT",
+      "time": 1791057192000,
+      "info": "8817058869",
+      "tranId": "900618817058869",
+      "tradeId": "8817058869"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0738782",
+      "asset": "USDT",
+      "time": 1791057974000,
+      "info": "8817068901",
+      "tranId": "900608817068901",
+      "tradeId": "8817068901"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.21505",
+      "asset": "USDT",
+      "time": 1791057974000,
+      "info": "8817068901",
+      "tranId": "900608817068901",
+      "tradeId": "8817068901"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01208619",
+      "asset": "USDT",
+      "time": 1791057985000,
+      "info": "8817069252",
+      "tranId": "900608817069252",
+      "tradeId": "8817069252"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02148656",
+      "asset": "USDT",
+      "time": 1791057985000,
+      "info": "8817069253",
+      "tranId": "900608817069253",
+      "tradeId": "8817069253"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01074328",
+      "asset": "USDT",
+      "time": 1791057985000,
+      "info": "8817069254",
+      "tranId": "900608817069254",
+      "tradeId": "8817069254"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.10474698",
+      "asset": "USDT",
+      "time": 1791057985000,
+      "info": "8817069255",
+      "tranId": "900608817069255",
+      "tradeId": "8817069255"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.01132966",
+      "asset": "USDT",
+      "time": 1791072000000,
+      "info": "FUNDING_FEE",
+      "tranId": "1589163954443841062",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.1495725",
+      "asset": "USDT",
+      "time": 1791079547000,
+      "info": "8817303659",
+      "tranId": "900618817303659",
+      "tradeId": "8817303659"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-1.01898",
+      "asset": "USDT",
+      "time": 1791079547000,
+      "info": "8817303659",
+      "tranId": "900618817303659",
+      "tradeId": "8817303659"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.03363762",
+      "asset": "USDT",
+      "time": 1791082066000,
+      "info": "8817337344",
+      "tranId": "900618817337344",
+      "tradeId": "8817337344"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00368943",
+      "asset": "USDT",
+      "time": 1791100800000,
+      "info": "FUNDING_FEE",
+      "tranId": "1590371916386595301",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00207236",
+      "asset": "USDT",
+      "time": 1791129600000,
+      "info": "FUNDING_FEE",
+      "tranId": "1591579874135042781",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00668867",
+      "asset": "USDT",
+      "time": 1791158400000,
+      "info": "FUNDING_FEE",
+      "tranId": "1592787834358128851",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00471386",
+      "asset": "USDT",
+      "time": 1791187200000,
+      "info": "FUNDING_FEE",
+      "tranId": "1593995794497335661",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04359936",
+      "asset": "USDT",
+      "time": 1791209273000,
+      "info": "8820926155",
+      "tranId": "900608820926155",
+      "tradeId": "8820926155"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0435208",
+      "asset": "USDT",
+      "time": 1791209966000,
+      "info": "8820981622",
+      "tranId": "900618820981622",
+      "tradeId": "8820981622"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.15712",
+      "asset": "USDT",
+      "time": 1791209966000,
+      "info": "8820981622",
+      "tranId": "900618820981622",
+      "tradeId": "8820981622"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02585054",
+      "asset": "USDT",
+      "time": 1791210005000,
+      "info": "8820985584",
+      "tranId": "900618820985584",
+      "tradeId": "8820985584"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02439",
+      "asset": "USDT",
+      "time": 1791210614000,
+      "info": "8821019658",
+      "tranId": "900608821019658",
+      "tradeId": "8821019658"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.1078609",
+      "asset": "USDT",
+      "time": 1791210614000,
+      "info": "8821019658",
+      "tranId": "900608821019658",
+      "tradeId": "8821019658"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02567327",
+      "asset": "USDT",
+      "time": 1791210813000,
+      "info": "8821062085",
+      "tranId": "900608821062085",
+      "tradeId": "8821062085"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02562178",
+      "asset": "USDT",
+      "time": 1791210954000,
+      "info": "8821104080",
+      "tranId": "900618821104080",
+      "tradeId": "8821104080"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.10298",
+      "asset": "USDT",
+      "time": 1791210954000,
+      "info": "8821104080",
+      "tranId": "900618821104080",
+      "tradeId": "8821104080"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00209303",
+      "asset": "USDT",
+      "time": 1791216000000,
+      "info": "FUNDING_FEE",
+      "tranId": "1595203753713791891",
+      "tradeId": ""
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.04254145",
+      "asset": "USDT",
+      "time": 1791217726000,
+      "info": "8147959542",
+      "tranId": "900318147959542",
+      "tradeId": "8147959542"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.042818",
+      "asset": "USDT",
+      "time": 1791229101000,
+      "info": "8148251013",
+      "tranId": "900308148251013",
+      "tradeId": "8148251013"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.5531",
+      "asset": "USDT",
+      "time": 1791229101000,
+      "info": "8148251013",
+      "tranId": "900308148251013",
+      "tradeId": "8148251013"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.03519814",
+      "asset": "USDT",
+      "time": 1791229152000,
+      "info": "8821918250",
+      "tranId": "900608821918250",
+      "tradeId": "8821918250"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.09209909",
+      "asset": "USDT",
+      "time": 1791229152000,
+      "info": "8821918250",
+      "tranId": "900608821918250",
+      "tradeId": "8821918250"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0108532",
+      "asset": "USDT",
+      "time": 1791232596000,
+      "info": "8821977736",
+      "tranId": "900618821977736",
+      "tradeId": "8821977736"
+    },
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "-3.9424577",
+      "asset": "USDT",
+      "time": 1791239018000,
+      "info": "TRANSFER",
+      "tranId": "418094157740",
+      "tradeId": ""
+    },
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "3.9424577",
+      "asset": "USDT",
+      "time": 1791239170000,
+      "info": "TRANSFER",
+      "tranId": "418094157443",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01086264",
+      "asset": "USDT",
+      "time": 1791239707000,
+      "info": "8822087900",
+      "tranId": "900608822087900",
+      "tradeId": "8822087900"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.01888",
+      "asset": "USDT",
+      "time": 1791239707000,
+      "info": "8822087900",
+      "tranId": "900608822087900",
+      "tradeId": "8822087900"
+    },
+    {
+      "symbol": "",
+      "incomeType": "TRANSFER",
+      "income": "75.48",
+      "asset": "USDT",
+      "time": 1791240385000,
+      "info": "TRANSFER",
+      "tranId": "418095213400",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.02846014",
+      "asset": "USDT",
+      "time": 1791245192000,
+      "info": "8822175137",
+      "tranId": "900618822175137",
+      "tradeId": "8822175137"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0856904",
+      "asset": "USDT",
+      "time": 1791253466000,
+      "info": "8148753982",
+      "tranId": "900308148753982",
+      "tradeId": "8148753982"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.0856",
+      "asset": "USDT",
+      "time": 1791254607000,
+      "info": "8148783615",
+      "tranId": "900318148783615",
+      "tradeId": "8148783615"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.1808",
+      "asset": "USDT",
+      "time": 1791254607000,
+      "info": "8148783615",
+      "tranId": "900318148783615",
+      "tradeId": "8148783615"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.29880235",
+      "asset": "USDT",
+      "time": 1791257952000,
+      "info": "8148850076",
+      "tranId": "900318148850076",
+      "tradeId": "8148850076"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.29925",
+      "asset": "USDT",
+      "time": 1791258657000,
+      "info": "8148865571",
+      "tranId": "900308148865571",
+      "tradeId": "8148865571"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "0.8953",
+      "asset": "USDT",
+      "time": 1791258657000,
+      "info": "8148865571",
+      "tranId": "900308148865571",
+      "tradeId": "8148865571"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.29925524",
+      "asset": "USDT",
+      "time": 1791258681000,
+      "info": "8148866128",
+      "tranId": "900308148866128",
+      "tradeId": "8148866128"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.042768",
+      "asset": "USDT",
+      "time": 1791259365000,
+      "info": "8148877617",
+      "tranId": "900318148877617",
+      "tradeId": "8148877617"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.042768",
+      "asset": "USDT",
+      "time": 1791259365000,
+      "info": "8148877618",
+      "tranId": "900318148877618",
+      "tradeId": "8148877618"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.21384",
+      "asset": "USDT",
+      "time": 1791259365000,
+      "info": "8148877619",
+      "tranId": "900318148877619",
+      "tradeId": "8148877619"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.0345",
+      "asset": "USDT",
+      "time": 1791259365000,
+      "info": "8148877617",
+      "tranId": "900318148877617",
+      "tradeId": "8148877617"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.0345",
+      "asset": "USDT",
+      "time": 1791259365000,
+      "info": "8148877618",
+      "tranId": "900318148877618",
+      "tradeId": "8148877618"
+    },
+    {
+      "symbol": "BTCUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-0.1725",
+      "asset": "USDT",
+      "time": 1791259365000,
+      "info": "8148877619",
+      "tranId": "900318148877619",
+      "tradeId": "8148877619"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00118503",
+      "asset": "USDT",
+      "time": 1791273600000,
+      "info": "FUNDING_FEE",
+      "tranId": "1597619672230588911",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.0032048",
+      "asset": "USDT",
+      "time": 1791302400000,
+      "info": "FUNDING_FEE",
+      "tranId": "1598827632202015531",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.01756378",
+      "asset": "USDT",
+      "time": 1791304274000,
+      "info": "8824002147",
+      "tranId": "900618824002147",
+      "tradeId": "8824002147"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.08631616",
+      "asset": "USDT",
+      "time": 1791330108000,
+      "info": "8824543149",
+      "tranId": "900618824543149",
+      "tradeId": "8824543149"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.02438518",
+      "asset": "USDT",
+      "time": 1791331200000,
+      "info": "FUNDING_FEE",
+      "tranId": "1600035591670132041",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00826657",
+      "asset": "USDT",
+      "time": 1791360000000,
+      "info": "FUNDING_FEE",
+      "tranId": "1601243551599619801",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00858999",
+      "asset": "USDT",
+      "time": 1791388800000,
+      "info": "FUNDING_FEE",
+      "tranId": "1602451509473899481",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "0.00836858",
+      "asset": "USDT",
+      "time": 1791417600000,
+      "info": "FUNDING_FEE",
+      "tranId": "1603659468732293751",
+      "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "COMMISSION",
+      "income": "-0.05399184",
+      "asset": "USDT",
+      "time": 1791418026000,
+      "info": "8829012253",
+      "tranId": "900608829012253",
+      "tradeId": "8829012253"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "REALIZED_PNL",
+      "income": "-5.45067857",
+      "asset": "USDT",
+      "time": 1791418026000,
+      "info": "8829012253",
+      "tranId": "900608829012253",
+      "tradeId": "8829012253"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00073165",
+      "asset": "USDT",
+      "time": 1791446400000,
+      "info": "FUNDING_FEE",
+      "tranId": "1604867429878129401",
+      "tradeId": ""
+    }
+  ],
+  "ranges": [
+    [
+      1783779005560,
+      1791469170834
+    ]
+  ],
+  "start": 1783779570834,
+  "end": 1791469170834,
+  "complete": true,
+  "account_scope": "2bf47f4761d2b477852024c2",
+  "schema_version": 1
+}

@@ -1,0 +1,1 @@
+{"symbol": "ETHUSDT", "fetched": "2026-10-08T13:42:59.106857+00:00", "rules": {"symbol": "ETHUSDT", "min_notional": 20.0, "step_size": 0.001, "min_qty": 0.001, "market_max_qty": 2000.0}}

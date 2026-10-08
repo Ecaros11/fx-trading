@@ -1,4 +1,0 @@
-cd D:\ProgramData\deepseekPlayground\fx-trading
-git add -A
-git commit -m "说明这次改了什么"
-git push

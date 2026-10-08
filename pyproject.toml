@@ -1,14 +1,9 @@
 [project]
 name = "fx-trading"
 version = "0.1.0"
-description = "Add your description here"
+description = "ETHUSDT MA50 signal and account drawdown tools"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "websockets>=17.1",
-]
-
-[tool.uv.workspace]
-members = [
-    "paper",
+    "numpy>=2.5.3",
 ]

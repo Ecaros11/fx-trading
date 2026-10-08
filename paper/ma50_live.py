@@ -1,31 +1,9 @@
-"""
-MA50 固定仓位 · 可执行工具（ma50_live.py）
-=========================================
-规则见 ma50_rules.md，一句话：日线收盘 > MA50 → 做多，否则空仓。
+"""ETHUSDT MA50 manual trading tool.
 
-用法：
-  python ma50_live.py                  # 出今天的信号（默认，写报告）
-  python ma50_live.py --console        # 同时打到控制台
-  python ma50_live.py --check          # 顺带读账户，算出该下单多少
-  python ma50_live.py --archive        # 把今天的信号写进归档
-  python ma50_live.py --history        # 看归档和前向检验进度
-  python ma50_live.py --backfill       # 回填归档里的前向收益
-  python ma50_live.py --selfcheck      # 自检：结构、口径一致性、边界
-
-⚠️ 只做多。仓位【不是常量】——它按本金自动匹配版本：
-
-     ⚠️ V2 默认锁定 60% 档，不自动升档。
-        下面的阶梯只在你用 --target-vol 切档时才生效：
-
-     权益 < 14.2U          →  开不出单（最小名义 20U 都下不了）
-     14.2 ~ 31.7U         →  固定版：仓位 = max(1.0, 20 ÷ 权益)
-     31.7 ~ 47.5U         →  波动率目标 40%（默认 60% 需 ≥ 31.7U）
-     47.5 ~ 76.1U         →  波动率目标 25%
-     76.1 ~ 126.8U        →  波动率目标 15%
-     ≥ 126.8U             →  全部档位可用
-
-   门槛 = 最小名义 20U ÷ 【有仓位日的第 10 分位仓位】（见 METHODS 表）。
-   工具每次运行都读账户重算，不需要手动改参数。
+Daily completed close above MA50 and realized volatility at most 120% permits
+long exposure. Default target volatility is 60%. All quantities pass shared
+exchange/account constraints before display and archive. No orders are sent.
+See README.md for CLI modes and ma50_rules.md for accounting assumptions.
 """
 import argparse
 import csv
@@ -40,175 +18,144 @@ import numpy as np
 ROOT = pathlib.Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from ma50_core import (ExchangeRules, PositionState, parse_positions, plan_order,
+                       strategy_position, finite, max_position, OrderPlan)
+import tempfile
+from contextlib import contextmanager
+from dataclasses import asdict
+import ma50_core as strategy
+
+class DataError(ValueError):
+    pass
+
+def format_qty(value):
+    places = max(0, -strategy.decimal(STEP_SIZE).normalize().as_tuple().exponent)
+    return f"{value:.{places}f}"
+
+
+def current_rules():
+    return ExchangeRules(SYM, MIN_NOTIONAL, STEP_SIZE, MIN_QTY, MARKET_MAX_QTY)
+
+def cached_rules():
+    data = json.loads(_RULES_CACHE.read_text(encoding="utf-8"))
+    if data.get("symbol") != SYM:
+        raise DataError("规则缓存标的未验证，需联网重建")
+    fetched = dt.datetime.fromisoformat(data["fetched"])
+    if fetched.tzinfo is None or not -300 <= (dt.datetime.now(dt.UTC)-fetched).total_seconds() <= 7*86400:
+        raise DataError("交易规则缓存无效或已过期")
+    return ExchangeRules(**data["rules"]), f"本地缓存（{data['fetched']}）"
+
+def validate_bars(bars, continuous=False):
+    if not isinstance(bars, list) or not bars:
+        raise DataError("日线缓存为空或格式无效")
+    previous = None
+    for b in bars:
+        t = int(b["t"])
+        if t != b["t"] or t % 86400000:
+            raise DataError("日线时间未对齐 UTC")
+        if previous is not None and (t <= previous or (continuous and t-previous != 86400000)):
+            raise DataError("日线有缺口、重复或倒序")
+        v = {k: finite(b[k], k, 0) for k in ("o","h","l","c","v")}
+        if min(v[k] for k in ("o","h","l","c")) <= 0 or not v["l"] <= min(v["o"],v["c"]) <= max(v["o"],v["c"]) <= v["h"]:
+            raise DataError("日线 OHLC 无效")
+        previous = t
+    return bars
+
+def kline_record(x):
+    return {"t":int(x[0]), "o":float(x[1]), "h":float(x[2]), "l":float(x[3]),
+            "c":float(x[4]), "v":float(x[5]), "closeTime":int(x[6])}
+
+def load_funding():
+    try:
+        return strategy.validate_funding(json.loads(FUND.read_text(encoding="utf-8")))
+    except (ValueError,TypeError,KeyError) as error:
+        raise DataError(f"资金费缓存无效：{error}") from None
+
+
 SYM = "ETHUSDT"
-MA_WINDOW = 50
+MA_WINDOW = strategy.MA_WINDOW
 
-# ══════════════════════════════════════════════════════════════════════
-#  V2：与 V1 的唯一区别就在这两行
-#    · 波动率窗口 20 → 10   （实测年化优势 +11.7pp，HAC t≈2.04）
-#    · 默认目标波动 40% → 60%（实测收益 2.2 倍，最差回撤 −17% → −29%）
-#  ⚠️ V1 和 V2 并行运行，互不影响：
-#     归档文件不同、报告目录不同，但共用同一份日线/资金费缓存。
-# ══════════════════════════════════════════════════════════════════════
-VOL_WINDOW = 10                # ← V1 是 20
-DEFAULT_TARGET_VOL = 0.60      # ← V1 是「按权益自动选」，这里默认锁 60%
-VOL_CAP = 1.20                 # 已实现波动 > 120% ⇒ 强制空仓（防强平）
-                               #   None = 关闭该保护
-# ⚠️ 这个常量【不再用于计算】。固定版的仓位由 fixed_position() 按权益算
-#    （max(1.0, 20/权益)）。1.405 只是"20 ÷ 14.23"这个历史值的残留，
-#    现在仅作读账户失败时的兜底默认值。
+
+VOL_WINDOW = strategy.VOL_WINDOW
+DEFAULT_TARGET_VOL = strategy.TARGET_VOL
+VOL_CAP = strategy.VOL_CAP
+
+
 LEVERAGE = 1.405
-MIN_NOTIONAL = 20.0           # ETHUSDT 实测（币安硬约束：单笔名义 ≥ 20U）
+MIN_NOTIONAL = 20.0
 
-# ⚠️ 2026-10-08 新增：调仓的【软约束】—— 权益的 2%
-#    为什么需要：MIN_NOTIONAL 是【绝对】20U，本金越大它相对越紧：
-#        77U    ⇒ 20U = 26.02% 的仓位（很宽）
-#        1000U  ⇒ 20U =  2.00%（很紧）
-#        10000U ⇒ 20U =  0.20%（等于微调）
-#    ⇒ 本金大时会频繁触发【无意义的微调】
-#      （实测：这些微调只贡献 1.2% 的换手、0.05% 的手续费）
-#    ⇒ 加软约束后，门限 = max(20U, 权益×2%)
-#       1000U 时两者相等；再大时以 2% 为准
-#
-#    ⚠️ 在 77U 下这个约束【不生效】（77×2% = 1.54U < 20U）
-#       ⇒ 行为与之前完全相同，只是让未来本金变大时口径一致
-SOFT_REBALANCE_PCT = 0.02
-MMR = 0.004                   # ETHUSDT 第一档维持保证金率（fapi/v1/leverageBracket 实测）
 
-# ── 强平安全性（关键：要和【单笔逆向】比，不是和【累计回撤】比）──
-# 定义：入场 = 信号日收盘；持有期 = 次日到信号结束的次一日。
-# 62 笔完整交易的期间最大逆向（adverse_excursion.py 算）：
-# ⚠️ 出处：最差那笔是 2022-10-25 入场（1,459.20），2022-11-08 出场，逆向 −26.6%。
-#    第 2 名 2025-10-02（−24.1%），第 3 名 2021-03-29（−23.0%）。
-WORST_TRADE_LOW = -0.266      # 最低价口径（用这个判断强平安全性）
-WORST_TRADE_CLOSE = -0.245    # 收盘口径 —— 仅供文档 §2.5 的对照表引用，
-                              # 代码里不用它（强平看盘中最低价，收盘口径偏乐观）
-# 强平@标的 = 1/杠杆 − MMR。要安全，需 1/lev − MMR > |单笔最坏逆向|
-#   lev ≤ 3  →  强平 ≥ 32.9%  >  26.6%  ✅
-#   lev = 4  →  强平   24.6%  <  26.6%  ❌ 会被强平
+STEP_SIZE = 0.001
+MIN_QTY = 0.001
+MARKET_MAX_QTY = 2000.0
+EXCHANGE_RULES_SRC = "默认值（尚未加载）"
+_RULES_CACHE = ROOT / "data" / "live" / "exchange_rules.json"
+
+
+def load_exchange_rules(bn=None):
+    global MIN_NOTIONAL, STEP_SIZE, MIN_QTY, MARKET_MAX_QTY, EXCHANGE_RULES_SRC
+    if bn is None:
+        rules, source = cached_rules()
+    else:
+        try:
+            info = bn.fapi("/fapi/v1/exchangeInfo", signed=False)
+        except Exception as api_error:
+            try: rules, source = cached_rules()
+            except Exception as cache_error:
+                raise DataError(f"规则不可验证（API: {type(api_error).__name__}；缓存: {cache_error}）") from None
+            source += "；API 失败"
+        else:
+            # An authoritative suspension or invalid symbol must never be
+            # hidden by a previously trading cache. Fallback is for fetch errors.
+            try:
+                matches = [s for s in info["symbols"] if s.get("symbol") == SYM]
+                if len(matches) != 1: raise DataError("ETHUSDT 规则缺失或重复")
+                rules = ExchangeRules.from_symbol(matches[0])
+            except (ValueError,TypeError,KeyError) as error:
+                raise DataError(f"API交易规则无效，暂停建议：{error}") from None
+            source = "API 已验证"
+            try:
+                _atomic_write(_RULES_CACHE,json.dumps({"symbol":SYM,
+                    "fetched":dt.datetime.now(dt.UTC).isoformat(),"rules":asdict(rules)},ensure_ascii=False))
+            except OSError:
+                source += "；缓存保存失败（使用本次API规则）"
+    MIN_NOTIONAL, STEP_SIZE, MIN_QTY, MARKET_MAX_QTY = (rules.min_notional,rules.step_size,rules.min_qty,rules.market_max_qty)
+    EXCHANGE_RULES_SRC = source
+    return source
+
+
+SOFT_REBALANCE_PCT = strategy.SOFT_REBALANCE
+MMR = 0.004
+
+
+WORST_TRADE_LOW = -0.266
+WORST_TRADE_CLOSE = -0.245
+
+
 MAX_SAFE_LEV = 3
 
-# ── 目标波动率的【主动覆盖】 ──
-# 默认 None = 自动：选「门槛 ≤ 权益」的最高档
-# ⚠️ 那个自动逻辑有个副作用：门槛是 20U ÷ 仓位 算出来的，
-#    所以权益越大 → 落到门槛越高的档 → 而门槛最高的档恰好是
-#    目标波动【最低】的 15% 档 ⇒ 赚到钱之后自动降杠杆。
-#    定投场景下尤其明显：权益一过最高门槛就永久锁在 15%。
-#    用 --target-vol 40 可以强制锁定某一档。
-# ⚠️ 2026-10-08 修复：这里原来是 None，而 main() 实际用 DEFAULT_TARGET_VOL。
-#    后果：任何【外部调用】（脚本/测试 import 后直接调 advice()）
-#          都会静默拿到"按权益自动选档"的结果，与工具实际运行不一致。
-#    实测（equity=76.87, vol=32%）：
-#        模块级 None  ⇒ 自动选中 25% 档 ⇒ 仓位 0.7812x
-#        工具实际 0.60 ⇒ 60% 档        ⇒ 仓位 1.8750x   （差 1.09x）
-#    ⇒ 现在模块级默认就与 main() 一致。
+
 TARGET_VOL_OVERRIDE = DEFAULT_TARGET_VOL
-# 是否由 --target-vol 显式指定（只影响文案，不影响计算）
+
 TARGET_VOL_EXPLICIT = False
 
-# ── 波动率目标版的「标称 vs 实际」口径 ──
-# 「目标波动率 25%」指的是【在场时】的目标（仓位 × 已实现波动 = 25%，恒等）。
-# 而账户整体波动只有目标的 89%，因为 45% 的时间空仓：
-#     空仓日拉低            −26%
-#     波动预测的倒数凸性     +13%   （E[1/σ̂] > 1/E[σ̂]）
-#     ─────────────────────────
-#     净                    −11%   →  89%
-# ⚠️ 改数据时必须重算（vol_formula.py 可复现）。
+
 VOL_ACHIEVE = 0.89
-# ⚠️ 币安只允许【整数】杠杆。所以"目标仓位 1.3486x"是设不了的 ——
-#    实际要设 ceil(仓位)。杠杆设置【不改变仓位】，只决定占用多少保证金和强平距离。
 
-# ── 样本量与不确定性（改数据时必须同步重算，文档 §5.1/§8 引用同一组数）──
-SE_SHARPE = 0.387            # 年化夏普的标准误 = sqrt((1+S_d^2/2)/n)·sqrt(365)
-SAMPLE_YEARS = 6.70          # 回测年数（第 60 根起算）
-SAMPLE_DAYS = 2447           # 回测天数
-FEE_PER_SIDE = 0.0005
 
-# ── 按本金匹配版本 ──
-# 门槛 = 20U 最小名义 ÷ 【有仓位日的第 10 分位仓位】
-# 含义：本金达到门槛后，≥90% 的有仓位日都能下出最小单。
-# 这组数是从 ETHUSDT 日线算出来的（calc_thresholds.py），不是拍的。
-# 注意两个数不是一回事：
-#   日线总根数随数据增长；减 60 根预热 → 回测样本 SAMPLE_DAYS
-#
-# ⚠️ 「目标波动率」是【在场时】的目标，不是账户整体波动：
-#       仓位 × 已实现波动 = 目标        ← 恒等式，精确成立（未触发 3x 上限时）
-#    而账户整体波动约为目标的 89%，因为 45% 的时间空仓。
-#    净 −11% 是两股力相抵的结果：
-#       空仓日（45% 时间）           −26%
-#       波动预测的倒数凸性偏差        +13%   （E[1/σ̂] > 1/E[σ̂]）
-#    ⇒ 所以「用 25% 档」实际承担约 22% 的账户波动。
-#      想拿真正的 25%，直接选 40% 档即可 —— 不需要改公式。
-#
-#   (名称,            目标波动率,  门槛本金, 历史夏普, 历史最大回撤)
-#
-# ⚠️ 夏普/回撤的口径（换手算时会漂，所以必须写明）：
-#   · 算术夏普 = 日均收益 / 日标准差 × sqrt(365)
-#   · 收益对齐 = w[t-1] × r[t]（昨天收盘决定，今天持有）—— 不是 w[t] × r[t]
-#   · 含成本   = 手续费 5bp/边 × |Δw|（系数 1！不是 2）+ 每日实际资金费
-#   · 数据     = ETHUSDT 永续日线；回测样本见 SAMPLE_DAYS / SAMPLE_YEARS（第 60 根起算）
-#   · 回撤     = 【每天对账到 min(MAX_POS, 目标÷10日波动)】的复利净值最大回撤，
-#               含换手手续费与每日资金费。即实际执行路径的回撤，不是标称口径。
-#               40% 档在场平均仓位 0.6549（供核对）。
-#               ⚠️ 唯一真源是 align.py 的 panel()。
-#                  任何手写循环都要先和它逐点对比权重序列，否则会引入错位。
-#               固定版因杠杆随本金变，回撤用 dd_for_lev() 查表，不引用这里的数
-#
-# 🔴 2026-10-06 修正一：夏普那一列原来含【前视偏差】，已更正。
-#    错：w[i]（收盘[i] 才知道的信号）× r[i]（i-1→i 的收益）→ 夏普虚高 2.3~2.7 倍
-#    对：w[i-1] × r[i]，即先 align.lag()。详见 align.py 头部。
-#
-# 🔴 2026-10-06 修正二：align.py 的手续费原来是 `× 2`（多算一倍），已改为系数 1。
-#    ⇒ 夏普和回撤的口径都变了，本表随之更新：
-#         夏普 1.031 → 1.047（固定版）  1.217 → 1.2442（波动率目标）
-#         回撤不变（-0.712 / -0.325 / -0.211 / -0.130 与系数 1 一致，原本就对）
-#    手续费系数的证明见 align.py 的 `lag()` 之后那段注释。
-#
-# ══════════════════════════════════════════════════════════════════════
-#  V2 的 METHODS（10 日窗口 + 波动率上限 120% + 60% 档为默认）
-#    门槛 = 20U ÷ 有仓位日第 10 分位仓位   （与 V1 同一算法）
-#    实算（2019-11 ~ 2026-10，在场 1256 天，含手续费与资金费）：
-#        ┌────────┬────────┬────────┬──────────┬──────────┬────────┬────────┐
-#        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │
-#        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤
-#        │  固定版   │  14.2U │ 1.0332 │   82.8%  │   65.7%  │ -71.2% │  29.6x │
-#        │  60%   │  31.7U │ 1.2493 │   77.6%  │   82.1%  │ -54.3% │  55.6x │
-#        │  40%   │  47.5U │ 1.2389 │   52.3%  │   55.3%  │ -39.4% │  19.1x │
-#        │  25%   │  76.1U │ 1.2406 │   32.8%  │   34.2%  │ -26.1% │   7.2x │
-#        │  15%   │ 126.8U │ 1.2406 │   19.7%  │   20.2%  │ -16.3% │   3.4x │
-#        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘
-#    同期 ETH 买入持有：算数 74.9%  几何 51.0%
-#
-#  ⚠️ V2 默认【固定 60% 档】，不自动升档 —— 所以你只关心 60% 那一行。
-#     其余档位列在这里供 --target-vol 手动切换时参考。
-#  ⚠️ 手续费系数 = 1（不是 2）。证明见 align.py 的 `lag()` 之后那段注释。
-# ══════════════════════════════════════════════════════════════════════
-# METHODS 是【快照】—— 记录它是哪天的数据算出来的。
-# selfcheck 的容差按「距离这个日期的天数」动态放大：
-#   数据每天长 1 根 ⇒ 夏普约漂移 0.0012/天
-#   ⇒ 容差 = max(0.003, 0.0012 × 天数)，上限 0.02
-# 超出容差时跑 `--sync-methods` 一键更新。
-METHODS_ASOF = "2026-10-08"
+SE_SHARPE = 0.387
+SAMPLE_YEARS = 6.7
+SAMPLE_DAYS = 2447
+FEE_PER_SIDE = strategy.FEE
 
-METHODS = [
-    ("固定版",             None,      14.2,     1.0332, -0.712),
-    ("波动率目标 60%",       0.6,       31.7,     1.2493, -0.543),
-    ("波动率目标 40%",       0.4,       47.5,     1.2389, -0.394),
-    ("波动率目标 25%",       0.25,      76.1,     1.2406, -0.261),
-    ("波动率目标 15%",       0.15,      126.8,    1.2406, -0.163),
-]
 
-# ── 固定版的回撤随杠杆变（同一策略，只缩放仓位，夏普不变但回撤变）──
-# 实测 ETHUSDT 回测样本见 SAMPLE_DAYS，扣成本+资金费（手续费系数 1）。
-# 用于按【实际杠杆】报回撤。改动时用 --selfcheck 的 ④ 段核对。
-#
-# ⚠️ 2026-10-06 说明：这组数一度被"修正"成 -0.469/-0.557/-0.636/-0.719/-0.787/-0.890，
-#    那次修正是错的 —— 当时以为 align.py 的 ×2 是对的，于是把本来正确的表改偏了。
-#    现在 align.py 已改为系数 1，本表恢复为实测值。
-DD_BY_LEV = [
-    (0.80, -0.462), (1.00, -0.550), (1.20, -0.629),
-    (1.405, -0.712), (1.60, -0.780), (2.00, -0.884),
-]
+METHODS_ASOF = '2026-10-08'
+
+METHODS = [('固定参考 1.405x', None, 6.7, 1.1329, -0.727), ('波动率目标 60%', 0.6, 31.7, 1.2487, -0.543), ('波动率目标 40%', 0.4, 47.5, 1.2379, -0.393), ('波动率目标 25%', 0.25, 76.1, 1.2391, -0.26), ('波动率目标 15%', 0.15, 126.8, 1.2387, -0.162)]
+
+
+DD_BY_LEV = [(0.8, -0.498), (1.0, -0.585), (1.2, -0.661), (1.405, -0.727), (1.6, -0.779), (2.0, -0.862)]
 
 
 def dd_for_lev(lev):
@@ -237,7 +184,7 @@ def fixed_position(equity):
         return 0.0
     return max(1.0, MIN_NOTIONAL / equity)
 
-ARCHIVE = ROOT / "data" / "live" / "ma50_log.csv"   # V2 独立归档
+ARCHIVE = ROOT / "data" / "live" / "ma50_log.csv"
 CACHE = ROOT / "data" / "crypto" / f"{SYM}.json"
 FUND = ROOT / "data" / "funding" / f"{SYM}.json"
 
@@ -247,242 +194,159 @@ FIELDS = [
     "equity_at_signal", "method", "target_vol",
     "realized_vol_pct", "target_position",
     "lev_setting", "margin_mode", "liq_acc_pct",
-    "funding_pct_today",        # 决策日那天的资金费
-    "funding_pct_next",         # 次日（实际持有第 1 天）的资金费
-    # 事后回填
+    "funding_pct_today",
+    "funding_pct_next",
+
     "entry_ref", "fwd_1d", "fwd_7d", "fwd_10d", "fwd_30d",
     "max_dd_10d", "checked_at", "status", "notes",
 ]
 
+FIELDS += ["rebalance_policy","soft_rebalance_pct","trend_signal","decision_reason","side","position_side","reduce_only","order_qty","target_qty","validation_status","price_return_1d","price_return_7d","price_return_10d","price_return_30d","price_drawdown_10d"]
 
-# ══════════════════ 数据 ══════════════════
+
 def _atomic_write(path, text, encoding="utf-8"):
-    """
-    原子写：先写 .tmp，再 os.replace（同一文件系统上的重命名是原子的）。
-
-    ⚠️ 2026-10-08 审计：原来三处直接 path.write_text(...)，
-       写入中途被 Ctrl-C / 断电 / SIGKILL 打断会留下【截断的 JSON】。
-       虽然 load_cache 能自愈（检测到损坏 ⇒ 全量重建），
-       但那要 ~25 秒 + 需要网络；网络不通时工具就不可用了。
-       ⇒ 改成原子写后，要么是旧文件、要么是新文件，不会是半个。
-
-    os.replace 在 Windows 上也是原子的（同一卷内重命名）。
-    """
-    import os as _os
-    path = pathlib.Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding=encoding)
-    _os.replace(tmp, path)
+    path = pathlib.Path(path); path.parent.mkdir(parents=True,exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=path.name+".",suffix=".tmp",dir=path.parent)
+    try:
+        with os.fdopen(fd,"w",encoding=encoding,newline="") as f:
+            f.write(text); f.flush(); os.fsync(f.fileno())
+        os.replace(temp,path)
+    finally:
+        if os.path.exists(temp): os.unlink(temp)
 
 
-def complete_bars(bars):
-    """丢掉最后一根没走完的日线"""
-    if not bars:
-        return bars, "缓存是空的"
-    last = bars[-1]["t"] / 1000
-    age = dt.datetime.now(dt.UTC).timestamp() - last
-    if age < 86400 * 0.98:
-        return bars[:-1], f"丢掉最后一根（只走了 {age/3600:.1f} 小时）"
-    return bars, f"最后一根已走完（{age/3600:.1f} 小时前收）"
+def validate_pending_orders(bn):
+    # Both sources are required: UI protective orders use the Algo API.
+    counts = {}
+    for name, endpoint in (("普通", "/fapi/v1/openOrders"), ("条件", "/fapi/v1/openAlgoOrders")):
+        rows = bn.fapi(endpoint, {"symbol":SYM}, signed=True)
+        if not isinstance(rows,list) or any(not isinstance(r,dict) or r.get("symbol")!=SYM for r in rows):
+            raise DataError(f"{name}委托响应标的或格式无效")
+        counts[name] = len(rows)
+    if any(counts.values()):
+        raise DataError(f"存在未成交委托（普通{counts['普通']}、条件{counts['条件']}）；请核对既有委托及成交后的持仓再调仓")
+    return counts
+
+
+def complete_bars(bars, now_ms=None):
+    now_ms = int(dt.datetime.now(dt.UTC).timestamp()*1000) if now_ms is None else int(now_ms)
+    done = [b for b in bars if int(b.get("closeTime",int(b["t"])+86400000-1)) < now_ms]
+    return done, f"已完成 {len(done)} 根；剔除未完成 {len(bars)-len(done)} 根"
 
 
 def check_bar_continuity(bars, max_gap_h=25.0):
-    """
-    检查日线是否连续 —— 相邻两根应正好差 24 小时。
-
-    ⚠️ 为什么需要（2026-10-07 加）：
-       波动率是唯一【直接决定仓位】的输入。实测其失效模式：
-         · 数据不足 / 损坏  => 波动率【虚高】=> 仓位偏小 => 安全方向
-         · 但若窗口内【漏掉一天大跌】=> 波动率【虚低】=> 仓位偏大
-           => 过度杠杆 => 这是唯一指向危险方向的失效
-       而整数杠杆会吸收大部分数值误差（±20% 误差常仍在同一档），
-       所以真正要防的就是【数据缺口的语义错误】。
-
-    返回 (缺口列表, 说明)。缺口元素 = (前一根t, 后一根t, 间隔小时)。
-    """
-    if not bars or len(bars) < 2:
-        return [], "K 线不足 2 根，无法检查连续性"
-    gaps = []
-    for a, b in zip(bars, bars[1:]):
-        dh = (b["t"] - a["t"]) / 3600000.0
-        if dh > max_gap_h:
-            gaps.append((a["t"], b["t"], dh))
-    if not gaps:
-        return [], f"连续（{len(bars)} 根，无缺口）"
-    win_start = max(0, len(bars) - VOL_WINDOW - 2)
-    in_win = 0
-    for i, (a, b) in enumerate(zip(bars, bars[1:])):
-        if (b["t"] - a["t"]) / 3600000.0 > max_gap_h and i >= win_start:
-            in_win += 1
-    note = f"发现 {len(gaps)} 处缺口"
-    if in_win:
-        note += f"，其中 {in_win} 处在【波动率窗口内】=> 波动率可能虚低 => 仓位偏大"
-    else:
-        note += "（都不在波动率窗口内，影响有限）"
-    return gaps, note
+    gaps = [(a["t"],b["t"],(b["t"]-a["t"])/3600000) for a,b in zip(bars,bars[1:])
+            if b["t"]-a["t"] != 86400000]
+    return gaps, ("日期连续" if not gaps else f"发现 {len(gaps)} 处缺口、重复或倒序")
 
 
-def refresh_funding(bn):
-    """
-    增量更新资金费。
+def enrich_funding_marks(bn, rows, first_trade):
+    missing=[r for r in rows if r["t"]>=first_trade and not r.get("markPrice")]
+    if not missing:return rows
+    interval=28800000;start=min(r["t"] for r in missing)//interval*interval
+    end=max(r["t"] for r in missing)//interval*interval+interval-1;marks={}
+    for _ in range(100):
+        batch=bn.fapi("/fapi/v1/markPriceKlines",{"symbol":SYM,"interval":"8h","startTime":start,"endTime":end,"limit":1500},signed=False)
+        if not batch:break
+        for x in batch:
+            price=finite(x[1],"历史标记价格",0)
+            if price<=0:raise DataError("历史标记价格必须为正")
+            marks[int(x[0])]=price
+        next_start=int(batch[-1][0])+interval
+        if next_start<=start:raise DataError("标记价格分页没有前进")
+        start=next_start
+        if len(batch)<1500 or start>end:break
+    else:raise DataError("标记价格分页超过保护上限")
+    for row in missing:
+        key=row["t"]//interval*interval
+        if key not in marks:raise DataError("回测持有期的历史标记价格仍缺失")
+        row["markPrice"]=marks[key];row["markPriceSource"]="mark_kline_open_8h";row["markPriceApproximate"]=True
+    return rows
 
-    ⚠️ 这里原来【没有任何更新逻辑】—— FUND 在整个文件里只被读、从不被写，
-       所以资金费数据永远停在初始灌进去的那一刻。
-       后果：决策日/次日的资金费显示会越来越旧（实测落后了整整一天）。
-       资金费 8 小时结算一次（UTC 00:00 / 08:00 / 16:00），一天 3 条。
-
-    返回 (新增条数, 错误信息或 None)。
-    """
-    loc = []
+def refresh_funding(bn, end_ms=None, rebuild=False):
+    try: old = load_funding()
+    except Exception: old = []; rebuild = True
     try:
-        loc = json.loads(FUND.read_text(encoding="utf-8"))
-        if not isinstance(loc, list):
-            loc = []
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"  ⚠️ 资金费缓存坏了（{type(e).__name__}）—— 全量重建")
-        loc = []
-
-    last = max((int(x["t"]) for x in loc if isinstance(x, dict) and "t" in x),
-               default=0)
-    try:
-        if last:
-            got = bn.fapi("/fapi/v1/fundingRate",
-                          {"symbol": SYM, "startTime": last + 1, "limit": 1000},
-                          signed=False)
-        else:
-            got = bn.fapi("/fapi/v1/fundingRate",
-                          {"symbol": SYM, "limit": 1000}, signed=False)
-    except Exception as e:
-        return 0, f"{type(e).__name__}: {e}"
-
-    have = {int(x["t"]) for x in loc if isinstance(x, dict) and "t" in x}
-    add = 0
-    for x in got:
-        t = int(x["fundingTime"])
-        if t in have:
-            continue
-        loc.append({"t": t, "rate": float(x["fundingRate"])})
-        have.add(t)
-        add += 1
-    if add:
-        loc.sort(key=lambda x: x["t"])
-        FUND.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(FUND, json.dumps(loc))
-    return add, None
+        candles=load_cache();first=int(candles[0]["t"])
+        first_trade=int(candles[min(60,len(candles)-1)]["t"])
+        rebuild = rebuild or any(r["t"]>=first_trade and not r.get("markPrice") for r in old)
+        start = first if rebuild else old[-1]["t"]+1
+        end_ms = int(dt.datetime.now(dt.UTC).timestamp()*1000) if end_ms is None else int(end_ms)
+        merged = {int(r["t"]):r for r in old}; received = 0
+        for _ in range(100):
+            batch = bn.fapi("/fapi/v1/fundingRate",{"symbol":SYM,"startTime":start,"endTime":end_ms,"limit":1000},signed=False)
+            if not batch: break
+            for x in batch:
+                if x.get("symbol",SYM) != SYM: raise DataError("资金费标的错误")
+                t = int(x["fundingTime"]); rate = finite(x["fundingRate"],"资金费率")
+                if not start <= t <= end_ms: raise DataError("资金费返回范围异常")
+                row = {"t":t,"rate":rate}
+                if x.get("markPrice"):
+                    row["markPrice"] = finite(x["markPrice"],"标记价格",0)
+                    if row["markPrice"]<=0:raise DataError("资金费标记价格必须为正")
+                if "markPrice" not in row and merged.get(t,{}).get("markPrice"):
+                    for key in ("markPrice","markPriceSource","markPriceApproximate"):
+                        if key in merged[t]:row[key]=merged[t][key]
+                merged[t] = row; received += 1
+            next_start = max(int(x["fundingTime"]) for x in batch)+1
+            if next_start <= start: raise DataError("资金费分页没有前进")
+            start = next_start
+            if len(batch)<1000 or start>end_ms: break
+        else: raise DataError("资金费分页超过保护上限")
+        if rebuild and not received: raise DataError("资金费重建未获取历史数据")
+        strategy.validate_funding(list(merged.values()),first_trade,end_ms//86400000*86400000)
+        if received:
+            values=enrich_funding_marks(bn,sorted(merged.values(),key=lambda r:r["t"]),first_trade)
+            _atomic_write(FUND,json.dumps(values))
+        return len(merged)-len(old),None
+    except Exception as error: return 0,f"{type(error).__name__}: {error}"
 
 
 def fetch_all(bn):
-    """
-    从 API 拉【全量】日线。只用于缓存重建。
-    Binance 单次上限 1500 根，所以分页拉。
-    """
-    out, start = [], 1567900800000          # 2019-09-08
-    while True:
-        k = bn.fapi("/fapi/v1/klines",
-                    {"symbol": SYM, "interval": "1d",
-                     "startTime": start, "limit": 1500}, signed=False)
-        if not k:
-            break
-        for x in k:
-            out.append({"t": int(x[0]), "o": float(x[1]), "h": float(x[2]),
-                        "l": float(x[3]), "c": float(x[4]), "v": float(x[5])})
-        if len(k) < 1500:
-            break
-        start = int(k[-1][0]) + 86400000
-    return out
+    out, start = [], 1567900800000
+    for _ in range(100):
+        batch = bn.fapi("/fapi/v1/klines",{"symbol":SYM,"interval":"1d","startTime":start,"limit":1500},signed=False)
+        if not batch: break
+        next_start = int(batch[-1][0])+86400000
+        if next_start <= start: raise DataError("日线分页没有前进")
+        out.extend(kline_record(x) for x in batch); start = next_start
+        if len(batch) < 1500: break
+    else: raise DataError("日线分页超过保护上限")
+    return validate_bars(out,continuous=True)
 
 
-def load_cache(bn, rebuild=False):
-    """
-    安全读缓存。
-
-    ⚠️ 这里原来在 try 之外直接 json.loads(CACHE.read_text())，导致缓存一旦
-       损坏（文件不存在 / 空文件 / 非法 JSON / 空数组 / null）就抛
-       FileNotFoundError / JSONDecodeError / IndexError / TypeError，
-       而 CACHE 是【唯一】数据存储、七个参数里没有重建命令
-       ⇒ 工具会永久不可用，且报错不指向根因。
-
-    现在：任何损坏都自动走【全量重建】，并打印原因。
-    """
-    reason = None
+def load_cache(bn=None, rebuild=False):
     if not rebuild:
-        try:
-            old = json.loads(CACHE.read_text(encoding="utf-8"))
-            if not isinstance(old, list):
-                reason = f"顶层不是数组（{type(old).__name__}）"
-            elif not old:
-                reason = "空数组"
-            elif not all(isinstance(r, dict) and "t" in r and "c" in r for r in old):
-                reason = "缺少 t/c 字段"
-            else:
-                return old
-        except FileNotFoundError:
-            reason = "文件不存在"
-        except json.JSONDecodeError as e:
-            reason = f"JSON 非法（{e.msg}）"
-        except OSError as e:
-            reason = f"读不了（{e.strerror}）"
-        except Exception as e:
-            reason = type(e).__name__
-        print(f"  ⚠️ 缓存不可用（{reason}）—— 从 API 全量重建…")
-    else:
-        print("  --rebuild：从 API 全量重建缓存…")
-
-    old = fetch_all(bn)
-    if not old:
-        raise RuntimeError("API 没有返回任何 K 线 —— 检查网络 / 代理 / SYM")
-    old.sort(key=lambda r: r["t"])
-    CACHE.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(CACHE, json.dumps(old))
-    print(f"  ✅ 缓存已重建：{len(old)} 根"
-          f"（{dt.datetime.fromtimestamp(old[0]['t']/1000, dt.UTC):%Y-%m-%d} ~ "
-          f"{dt.datetime.fromtimestamp(old[-1]['t']/1000, dt.UTC):%Y-%m-%d}）")
-    return old
+        try: return validate_bars(json.loads(CACHE.read_text(encoding="utf-8")))
+        except Exception:
+            if bn is None: raise DataError("日线缓存无效，需联网 --rebuild") from None
+    if bn is None: raise DataError("缓存重建需要网络")
+    bars = fetch_all(bn); _atomic_write(CACHE,json.dumps(bars)); return bars
 
 
-def refresh(bn):
-    """回看最后 5 根，修正可能未走完时写入的值（和 eth_signal 同一个修法）"""
-    old = load_cache(bn)
-    old = json.loads(CACHE.read_text(encoding="utf-8"))
-    idx = {int(r["t"]): i for i, r in enumerate(old)}
-    last = int(old[-1]["t"])
-    fixed = []
-    st = {"ok": False, "err": None}
-    now_ms = dt.datetime.now(dt.UTC).timestamp() * 1000
-    # 回补范围要【自适应】：固定 limit=20 时，若缓存落后 30 天，
-    # 每次只能补回 14 天，要跑好几次才能追上（而期间会被 48h guard 拒绝）。
-    # 和 eth_signal.py 用同一个修法。
-    # limit 上限 1500 —— Binance 单次最多 1500 根，传更多会被截断（不报错但也不多给）。
-    _behind_days = int((now_ms - last) / 86400000) + 1
-    _want = max(5, min(_behind_days, 1500))      # Binance 单次上限 1500
+def refresh(bn, now_ms=None):
+    old = load_cache(bn); fixed = []; st = {"ok":False,"err":None}
     try:
-        k = bn.fapi("/fapi/v1/klines",
-                    {"symbol": SYM, "interval": "1d",
-                     "startTime": last - 5 * 86400000,
-                     "limit": min(_want + 10, 1500)}, signed=False)
-        for x in k:
-            r = {"t": int(x[0]), "o": float(x[1]), "h": float(x[2]),
-                 "l": float(x[3]), "c": float(x[4]), "v": float(x[5])}
-            i = idx.get(r["t"])
-            if i is None:
-                old.append(r); continue
-            if (now_ms - r["t"]) >= 86400000 and (
-                    old[i]["c"] != r["c"] or old[i]["v"] != r["v"]):
-                fixed.append((r["t"], old[i]["c"], r["c"]))
-            old[i] = r
-        old.sort(key=lambda r: r["t"])
-        _atomic_write(CACHE, json.dumps(old))
-        st["ok"] = True
-        # 资金费也要增量更新（原来完全没更新）
-        _add, _err = refresh_funding(bn)
-        st["fund_add"] = _add
-        st["fund_err"] = _err
-    except Exception as e:
-        st["err"] = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
-    return old, fixed, st
+        merged = {b["t"]:b for b in old}; start = old[-1]["t"]-5*86400000; received = 0
+        for _ in range(100):
+            batch = bn.fapi("/fapi/v1/klines",{"symbol":SYM,"interval":"1d","startTime":start,"limit":1500},signed=False)
+            if not batch: break
+            for x in batch:
+                received += 1
+                row = kline_record(x); prior = merged.get(row["t"])
+                if prior and prior["c"] != row["c"]: fixed.append((row["t"],prior["c"],row["c"]))
+                merged[row["t"]] = row
+            next_start = int(batch[-1][0])+86400000
+            if next_start<=start: raise DataError("日线分页没有前进")
+            start = next_start
+            if len(batch)<1500: break
+        else: raise DataError("日线分页超过保护上限")
+        if not received: raise DataError("行情API返回空数据，禁止将缓存视为刷新成功")
+        old = sorted(merged.values(),key=lambda b:b["t"]); validate_bars(old)
+        _atomic_write(CACHE,json.dumps(old)); st["ok"] = True
+        st["fund_add"],st["fund_err"] = refresh_funding(bn,end_ms=now_ms)
+    except Exception as error: st["err"] = f"{type(error).__name__}: {error}"
+    return old,fixed,st
 
 
 def ma(x, k):
@@ -494,197 +358,60 @@ def ma(x, k):
 
 
 def funding_by_day():
-    fd = json.loads(FUND.read_text(encoding="utf-8"))
-    d = {}
-    for x in fd:
-        k = int(x["t"] // 86400000)
-        d[k] = d.get(k, 0.0) + x["rate"]
-    return d
+    result = {}
+    for row in load_funding():
+        day = int(row["t"]//86400000); result[day] = result.get(day,0)+row["rate"]
+    return result
 
 
 def funding_settle_count():
-    """
-    返回 {日: 该日已结算次数}。
-
-    ⚠️ 为什么需要（2026-10-07 审计发现）：
-       资金费每天 3 次（UTC 00:00 / 08:00 / 16:00），但【当天】可能只结算了 1~2 次。
-       若直接把「当日合计」当成本，会严重低估。
-       实测：在 UTC 00:05（推荐使用时点）只有 1 次
-             ⇒ 显示值只有真实成本的 36%（低估 64%）。
-    """
-    fd = json.loads(FUND.read_text(encoding="utf-8"))
-    c = {}
-    for x in fd:
-        k = int(x["t"] // 86400000)
-        c[k] = c.get(k, 0) + 1
-    return c
+    result = {}
+    for row in load_funding():
+        day = int(row["t"]//86400000); result[day] = result.get(day,0)+1
+    return result
 
 
-# ══════════════════ 核心信号 ══════════════════
 def signal_of(bars):
-    if not bars:
-        return None
-    c = np.array([b["c"] for b in bars], float)
-    m50 = ma(c, MA_WINDOW)
-    if not np.isfinite(m50[-1]):
-        return None
-    close = c[-1]
-    ma_now = m50[-1]
-    return {
-        "bars": bars, "close": close, "ma50": ma_now,
-        "dist_pct": (close / ma_now - 1) * 100,
-        "long": bool(close > ma_now),
-        "prev_long": bool(c[-2] > m50[-2]) if np.isfinite(m50[-2]) else None,
-        "bar_t": bars[-1]["t"],
-    }
+    if len(bars)<MA_WINDOW: return None
+    c = np.array([b["c"] for b in bars],float); average = ma(c,MA_WINDOW)
+    rv = realized_vol(bars); prior_vol = realized_vol(bars[:-1])
+    if not np.isfinite(rv) or rv<=0: raise DataError("波动率无效")
+    trend = bool(c[-1]>average[-1]); active = trend and (VOL_CAP is None or rv<=VOL_CAP)
+    prior = (bool(c[-2]>average[-2]) and np.isfinite(prior_vol) and prior_vol>0 and (VOL_CAP is None or prior_vol<=VOL_CAP)) if np.isfinite(average[-2]) else None
+    return {"bars":bars,"close":float(c[-1]),"ma50":float(average[-1]),
+        "dist_pct":float((c[-1]/average[-1]-1)*100),"trend_long":trend,"long":bool(active),
+        "prev_long":prior,"rvol":rv,"reason":"trend_off" if not trend else ("vol_cap" if not active else "in_market"),"bar_t":bars[-1]["t"]}
 
 
 def pick_method(equity):
-    """
-    按本金选出能执行的最好版本。
-
-    ⚠️ 若 TARGET_VOL_OVERRIDE 已设（--target-vol），则强制用那一档，
-       不再按「门槛 ≤ 权益」自动选。原因：门槛 = 20U ÷ 仓位，
-       所以权益越大 → 落到门槛越高的档 → 而门槛最高的档恰好是
-       目标波动最低的 15% 档 ⇒ 赚到钱之后自动降杠杆（定投时尤其明显）。
-
-    返回 (名称, 目标波动率, 门槛, 夏普, 回撤, 下一档, 距离下一档还差多少)
-    """
-    # ── --target-vol 强制覆盖 ──
-    if TARGET_VOL_OVERRIDE is not None:
-        # 门槛取【最接近的那一档】—— 用于提示"权益够不够开出最小单"
-        _c = [m for m in METHODS if m[1] is not None]
-        _b = min(_c, key=lambda m: abs(m[1] - TARGET_VOL_OVERRIDE))
-        return (f"波动率目标 {TARGET_VOL_OVERRIDE*100:g}%",
-                TARGET_VOL_OVERRIDE, _b[2], _b[3], _b[4], None, _b[2] - equity)
-    # 连最低门槛都没到 —— 下一档就是第 1 档，不是"已是最高"
-    if equity < METHODS[0][2]:
-        return METHODS[0] + (METHODS[0], METHODS[0][2] - equity)
-    best = METHODS[0]
-    nxt = None
-    for i, m in enumerate(METHODS):
-        if equity >= m[2]:
-            best = m
-            nxt = METHODS[i + 1] if i + 1 < len(METHODS) else None
-    gap = (nxt[2] - equity) if nxt else None
-    return best + (nxt, gap)
+    if TARGET_VOL_OVERRIDE is None:
+        return METHODS[0] + (None,None)
+    base = min((m for m in METHODS if m[1] is not None),key=lambda m:abs(m[1]-TARGET_VOL_OVERRIDE))
+    need = base[2]*base[1]/TARGET_VOL_OVERRIDE
+    return (f"波动率目标 {TARGET_VOL_OVERRIDE*100:g}%",TARGET_VOL_OVERRIDE,need,base[3],base[4],None,None)
 
 
 def dynamic_drawdown(bars, fund_by_day, start_equity):
-    """
-    用【你的实际权益】跑一遍，看历史上最坏会跌到多少。
-
-    为什么要动态：固定版的仓位是 max(1.0, 20/权益)，权益一变仓位就变。
-    回测里用恒定杠杆是近似，而且方向不确定 —— 实测两者差 14pp：
-        恒定 1.353x  →  最大回撤 −69.0%
-        随权益变      →  最大回撤 −55.0%（权益涨过 20U 后仓位自动降到 1.0x）
-
-    返回 dict：最大回撤、路径最低点、峰值、期末权益。
-    ⚠️ 这不是"历史上真的跌到过 X" —— 起点不同结果不同，所以要用你的真实权益算。
-    """
-    if not bars or start_equity <= 0:
-        return None
-    C = np.array([b["c"] for b in bars], float)
-    T = np.array([b["t"] for b in bars], float)
-    n = len(C)
-    if n < 70:
-        return None
-    r = np.zeros(n)
-    r[1:] = C[1:] / C[:-1] - 1
-    m = ma(C, MA_WINDOW)
-    sg = np.nan_to_num((C > m).astype(float))
-    cd = np.array([int(t // 86400000) for t in T])
-    FR = np.nan_to_num(np.array([fund_by_day.get(int(d), np.nan) for d in cd]))
-
-    vol = np.full(n, np.nan)
-    for i in range(21, n):
-        vol[i] = r[i - VOL_WINDOW:i].std(ddof=1) * np.sqrt(365)
-
-    def _pos(eq_now, i):
-        """
-        第 i 天该持多少 —— 必须和实盘一样【每天重新读权益匹配版本】。
-        ⚠️ 这里原来写死了固定版的 max(1.0, 20/权益)，导致：
-           100 USDT 时它模拟 1.0x，而工具实际建议 0.347x（差 2.88 倍）。
-        """
-        if eq_now <= 0:
-            return 0.0, None
-        if not sg[i]:
-            # ⚠️ 空仓时【不能】返回 METHODS[0][0] —— 那会让 cur 每次进出场
-            #    都被重置成"固定版"，凭空多记一次切换。实测虚报约 110 次
-            #    （真实的在场切换只有 1~26 次）。返回 None = 不改变当前版本。
-            return 0.0, None
-        mname, tv, need = pick_method(eq_now)[:3]
-        if tv is None:
-            return max(1.0, MIN_NOTIONAL / eq_now), mname
-        v = vol[i]
-        if not np.isfinite(v) or v <= 0:
-            return 0.0, mname
-        # ⚠️ 用 MAX_POS 而不是硬编码 3.0 —— 与 target_position 保持一致
-        return min(MAX_POS, tv / v), mname
-
-    eq = start_equity
-    peak = eq
-    dd = 0.0
-    low = eq
-    switches = []
-    cur = None          # 首次进场才确立版本，空仓期不算切换
-    for i in range(MA_WINDOW + 1, n):
-        w, mname = _pos(eq, i - 1)        # 昨日收盘决定今日仓位
-        if mname is not None and mname != cur:
-            if cur is not None:
-                switches.append((i, eq, cur, mname))
-            cur = mname
-        w_prev = _pos(eq, i - 2)[0]
-        turn = abs(w - w_prev)
-        # 手续费 = turn × 单边费率。【不要 ×2】——
-        #   turn = |Δw| 已经是【每次实际成交的名义】，
-        #   一个完整往返 0→1.4→0 的 turn 之和 = 2.8，正好等于两次成交额。
-        #   ×2 会重复计算（把 1.30%/年 变成 2.60%/年）。
-        #   ⚠️ align.py 里的 * 2 是错的，主回测因此多算了一倍手续费。
-        eq *= (1 + w * r[i] - turn * FEE_PER_SIDE - w * FR[i])
-        if eq <= 0:
-            eq = 0.0
-            break
-        peak = max(peak, eq)
-        low = min(low, eq)
-        dd = min(dd, eq / peak - 1)
-    return {"dd": dd, "low": low, "peak": peak, "end": eq,
-            "switches": len(switches), "switch_log": switches}
+    if not bars or len(bars)<=60 or start_equity<=0: return None
+    from align import simulate
+    funding = load_funding()
+    result = simulate(bars,funding,TARGET_VOL_OVERRIDE,start_equity,FEE_PER_SIDE,
+                      rules=current_rules(),constrained=True,price_buffer=.001)
+    equity = np.r_[start_equity,result["equity"][60:]]
+    dd = float(np.min(equity/np.maximum.accumulate(equity)-1))
+    return {"dd":dd,"low":float(equity.min()),"peak":float(equity.max()),
+            "end":float(equity[-1]),"switches":0,"switch_log":[],"model":result["model"]}
 
 
-# ⚠️ bars 必须是【字典列表】（[{"c":...}]），不是 numpy 数组。
-#    传数组会报 IndexError: invalid index to scalar variable —— 不指向根因。
-#    要传数组请用 realized_vol_from_prices()（若有）。
 def realized_vol(bars, win=None):
-    """
-    过去 win 根【已走完】日线的年化波动率。用于波动率目标版。
-
-    win=None ⇒ 用 VOL_WINDOW（V2 = 10；V1 曾经硬编码 20）
-    ⚠️ 用 ddof=1（样本标准差）—— 这个直接决定仓位，改成 ddof=0 会让仓位高 6.1%。
-       详见 ma50_rules.md §12。
-    """
-    if win is None:
-        win = VOL_WINDOW
-    c = np.array([b["c"] for b in bars], float)
-    if len(c) < win + 2:
-        return float("nan")
-    r = np.diff(c[-(win + 1):]) / c[-(win + 1):-1]
-    return float(r.std(ddof=1) * np.sqrt(365))
+    win = VOL_WINDOW if win is None else win
+    if len(bars)<win+1: return float("nan")
+    c = np.array([b["c"] for b in bars[-win-1:]],float)
+    if not np.isfinite(c).all() or np.any(c<=0): return float("nan")
+    return float((np.diff(c)/c[:-1]).std(ddof=1)*np.sqrt(365))
 
 
-# ══════════════════ 保证金可行性（2026-10-07 审计）══════════════════
-# 逐仓下"能不能开出来"的判据（权益被消掉，只取决于 w）：
-#     (权益·w)/ceil(w) + 权益·w·FEE ≤ 权益
-#     ⟺  w/ceil(w) + w·FEE ≤ 1
-#
-# ⚠️ 坏区间：w ∈ (n/(1+n·FEE), n]（n = ceil(w) 为整数）
-#    n=1: (0.999500, 1]   n=2: (1.998002, 2]   n=3: (2.995507, 3]
-# 实测 60% 档有 19 天落在 w = 3.000000（被 3x 上限截断），1 天在 w≈0.9999
-# ⇒ 顶格时逐仓保证金 = 名义/n = 权益×100%，连手续费都付不起
-#
-# ⚠️ 全仓不受此限：保证金只需 名义×MMR ≈ 1.2%，且强平价与逐仓几乎相同
-#    （逐仓 1/L−MMR = 32.93% vs 全仓 (1/w−MMR)/(1−MMR) = 33.07%）
-MAX_LEV_SET = 3                      # 逐仓整数杠杆上限
+MAX_LEV_SET = strategy.MAX_LEVERAGE
 
 
 def max_pos_for(nlev, fee=None):
@@ -696,274 +423,78 @@ def max_pos_for(nlev, fee=None):
     return nlev / (1.0 + nlev * f)
 
 
-MAX_POS = max_pos_for(MAX_LEV_SET)   # ≈ 2.995507
+MAX_POS = max_pos_for(MAX_LEV_SET)
 
 
 def feasible_pos(w, fee=None):
-    """
-    把 w 向下调整到 w/ceil(w) + w·fee ≤ 1 的最小改动版。
-    返回调整后的 w（若本来就可行则原样返回）。
-    """
-    f = FEE_PER_SIDE if fee is None else fee
-    if w is None or w <= 0:
-        return 0.0
-    n_ = max(1, int(np.ceil(w - 1e-9)))
-    # ⚠️ 容差 1e-9：MAX_POS 处 lhs 恰好 = 1.0（实测差 1ulp），
-    #    没有容差的话 1ulp 抖动会误砍 0.1% 的仓位。
-    if w / n_ + w * f <= 1.0 + 1e-9:
-        return w
-    return n_ / (1.0 + n_ * f) * 0.999      # 留 0.1% 余量
+    return min(max(0, finite(w,"仓位")),max_pos_for(MAX_LEV_SET,fee))
 
 
 def target_position(equity, rvol, method):
-    """
-    返回目标仓位（占权益倍数）。method = (名称, 目标波动率, 门槛, ...)
-    · 固定版：max(1.0, 20/权益) —— 不是常量
-    · 波动率目标版：min(MAX_POS, target_vol / 已实现波动)
-
-    ⚠️ V2 新增：波动率上限 VOL_CAP
-       已实现波动 > VOL_CAP 时【强制空仓】。
-       实测（2019-11 ~ 2026-10，10日窗口 + 60%档 + 3x 逐仓）：
-           无上限：强平 2 次，最坏逆向 −58.5%，年化 81.4%，夏普 1.234
-           上限120%：强平 0 次，最坏逆向 −27.0%，年化 89.8%，夏普 1.321
-       ⚠️ 这组是【独立强平模拟】口径（允许仓位突破上限），
-          与主表的 align.panel 口径（60% 档：夏普 1.2493、几何 82.1%）是两套不同数字——本表只看强平次数，不比收益。
-       ⇒ 避开的是 2021-05-19（当日 10日波动 124.2%，持仓盘中 −58.5%）
-       ⇒ 有效区间很宽：90% ~ 130% 都能做到 0 次强平（不是单点拟合）
-    """
-    tv = method[1]
-    if tv is None:
-        return feasible_pos(fixed_position(equity))   # 固定版同理：max(1.0, 20/权益) 也可能落在坏区间
-    if rvol is None:
-        return 0.0
-    try:
-        if not np.isfinite(rvol) or rvol <= 0:
-            return 0.0
-    except TypeError:
-        return 0.0
-    if VOL_CAP is not None and rvol > VOL_CAP:
-        return 0.0                     # 波动率过高 ⇒ 空仓
-    # ⚠️ 用 MAX_POS 而不是硬编码 3.0 —— 顶格时逐仓开不出来（见上）
-    w = float(min(MAX_POS, tv / rvol))
-    # ⚠️ 2026-10-08 修复：只做上限截断还不够 ——
-    #    w 也可能落在 (n/(1+n·FEE), n] 这个坏区间里
-    #    （实测 2022-03-21：w=0.9998949 ⇒ ceil=1 ⇒ lhs=1.0003949 ⇒ 开不出来）
-    #    ⇒ 必须过一遍 feasible_pos
-    return feasible_pos(w)
+    return strategy_position(True,rvol,equity,method[1],FEE_PER_SIDE,VOL_CAP,MIN_NOTIONAL)[0]
 
 
 def leverage_plan(equity, position, notional):
-    """
-    把"目标仓位"翻译成币安上实际能设的参数。
-
-    关键区分（这也是最容易搞错的地方）：
-      · 杠杆【设置】  →  决定占用多少保证金、强平多远
-      · 仓位【大小】  →  由名义价值决定，与杠杆设置无关
-
-    ⚠️ 为什么要报全仓和逐仓两个：
-       当名义 > 权益时（本工具在权益 < 31.7U 时都是这样），
-       逐仓只锁 notional/杠杆 做保证金，强平反而更近；
-       全仓用整个权益做保证金，强平更远。
-       仓位本来就比账户大时，【全仓才是更安全的那个】。
-    """
-    if notional <= 0 or equity <= 0:
-        return None
-    lev = max(1, int(np.ceil(position - 1e-9)))     # 币安只允许整数，向上取
-    margin = notional / lev
-    spare = max(0.0, equity - margin)
-
-    def liq(backing):
-        """给定真正做保证金的钱，返回 (标的跌幅, 账户跌幅)"""
-        px = backing / notional - MMR
-        px = max(0.0, min(px, 1.0))
-        acc = (equity - px * notional) / equity - 1
-        return px, acc
-
-    liq_iso_px, liq_iso_acc = liq(margin)              # 逐仓：只有分配的保证金
-    liq_cross_px, liq_cross_acc = liq(margin + spare)  # 全仓：整个权益
-    # 会不会被强平？要和【单笔最坏逆向】比，不是和【累计回撤】比。
-    # 这是之前写错过的地方：-68.9% 是跨 62 笔的累计回撤，不是单笔跌幅。
-    safe = liq_iso_px > abs(WORST_TRADE_LOW)
-    return {
-        "safe": safe, "lev_ok": lev <= MAX_SAFE_LEV,
-        "liq_iso_px": liq_iso_px, "liq_iso_acc": liq_iso_acc,
-        "liq_cross_px": liq_cross_px, "liq_cross_acc": liq_cross_acc,
-        "can_open": margin <= equity + 1e-9,
-        "lev": lev, "margin": margin, "spare": spare,
-        "liq_iso_px": liq_iso_px, "liq_iso_acc": liq_iso_acc,
-        "liq_cross_px": liq_cross_px, "liq_cross_acc": liq_cross_acc,
-        "can_open": margin <= equity + 1e-9,
-    }
+    if notional<=0 or equity<=0: return None
+    return {"lev":MAX_LEV_SET,"margin":notional/MAX_LEV_SET,
+            "spare":max(0,equity-notional/MAX_LEV_SET),
+            "can_open":notional/MAX_LEV_SET+notional*FEE_PER_SIDE<=equity+1e-9,
+            "lev_ok":True}
 
 
-def advice(equity, price, rvol=None):
-    """
-    给定权益和当前价，算出该下多少。【主流程也调这个函数】——
-    这样算的地方只有一处，不会再出现"显示用一种算法、下单用另一种"。
-
-    返回一个 dict，含所有中间量，供显示和归档共用。
-    """
-    # ⚠️ 边界防护（2026-10-07 审计发现）：
-    #    · equity=None ⇒ 旧代码在 `equity < mneed` 处抛 TypeError
-    #    · price<=0    ⇒ qty 算出 nan/负值，但 feasible 仍报 True
-    #    实际不可达（equity 来自账户、price 来自行情），但防护应与
-    #    target_position 对 rvol=None 的处理保持一致。
-    if equity is None or price is None:
-        return {"method": "—", "position": 0.0, "notional": 0.0, "qty": 0.0,
-                "feasible": False, "fail": "bad_input", "threshold": 0.0,
-                "reason": "输入无效（equity/price 为 None）"}
-    if price <= 0:
-        return {"method": "—", "position": 0.0, "notional": 0.0, "qty": 0.0,
-                "feasible": False, "fail": "bad_price", "threshold": 0.0,
-                "reason": f"价格无效（{price}）"}
-    mname, tv, mneed, msr, mdd_tab, nxt, gap = pick_method(equity)
-    pos = target_position(equity, rvol, (mname, tv, mneed, msr, mdd_tab))
-    # 低于该版本的最低门槛 → 无论算出什么仓位都开不出来
-
-    # 失败原因要分开报，不能笼统说"名义不足"
-    # ⚠️ 必须先判【低于最低门槛】：否则会出现
-    #    "低于门槛开不出单" 和 "✅ 可下单" 同时打印的自相矛盾
-    if equity < mneed:
-        fail = "below_min"
-    elif tv is not None and pos <= 0:
-        fail = "vol"                    # 算不出已实现波动，与本金无关
-    elif pos <= 0:
-        fail = "pos"
-    elif equity * pos < MIN_NOTIONAL:
-        fail = "notional"
-    else:
-        # ⚠️ 2026-10-07 审计：#2 保证金可行性
-        #    逐仓：保证金 = 名义/ceil(w)，加手续费可能超过权益
-        #    ⇒ 判据 w/ceil(w) + w·FEE ≤ 1（与权益无关！）
-        #    实测 60% 档有 20 天触发（19 天是 w=3.0 顶格）
-        fail = None
-        if pos > 0:
-            _n_lev = int(np.ceil(pos - 1e-9))
-            _lhs = pos / _n_lev + pos * FEE_PER_SIDE
-            # ⚠️ MAX_POS 下 _lhs 恰好 = 1.0（临界），加容差防浮点抖动
-            if _lhs > 1.0 + 1e-9:
-                fail = "margin"
-    _margin_note = None
-    if fail == "margin":
-        _margin_note = (
-            f"逐仓开不出来：保证金 {pos/np.ceil(pos-1e-9)*100:.2f}% 权益"
-            f" + 手续费 {pos*FEE_PER_SIDE*100:.3f}% > 100%"
-            f"；可改【全仓】（保证金仅需 {pos*MMR*100:.2f}%，"
-            f"强平距离几乎相同）")
-
-    notional = equity * pos
-    # 固定版的回撤随【实际杠杆】变；波动率目标版用表里的数
-    dd = dd_for_lev(pos) if tv is None else mdd_tab
-    lev_plan = leverage_plan(equity, pos, notional)
-    return {
-        "lev_plan": lev_plan,
-        "method": mname, "target_vol": tv, "threshold": mneed,
-        "sharpe": msr, "drawdown": dd, "next": nxt, "gap": gap,
-        "position": pos, "notional": notional,
-        "qty": notional / price if price > 0 else float("nan"),
-        "feasible": fail is None, "fail": fail,
-        "need_equity": (MIN_NOTIONAL / pos) if pos > 0 else float("inf"),
-        "worst": equity * (1 + dd),
-        "margin_note": _margin_note,
-        "feasible_pos": feasible_pos(pos),
-        "max_ok_pos": max_pos_for(int(np.ceil(max(pos, 1e-9)))),
-    }
+def advice(equity, price, rvol=None, trend_long=True, fee=None):
+    fee = FEE_PER_SIDE if fee is None else fee
+    try:
+        equity = finite(equity,"权益",0); price = finite(price,"价格",0)
+        if equity<=0 or price<=0: raise ValueError("价格和权益必须为正")
+        name,tv,need,sh,dd,nxt,gap = pick_method(equity)
+        position,reason = strategy_position(trend_long,rvol,equity,tv,fee,VOL_CAP,MIN_NOTIONAL)
+        notional = equity*position
+        fail = "notional" if position>0 and notional<MIN_NOTIONAL else None
+        return {"method":name,"target_vol":tv,"threshold":need,"position":position,
+            "notional":notional,"qty":notional/price,"feasible":fail is None,"fail":fail,
+            "reason":reason,"sharpe":sh,"drawdown":dd,"next":nxt,"gap":gap,
+            "need_equity":MIN_NOTIONAL/position if position else float("inf"),
+            "worst":equity*(1+dd),"lev_plan":leverage_plan(equity,position,notional)}
+    except (ValueError,TypeError,OverflowError):
+        return {"method":"—","target_vol":TARGET_VOL_OVERRIDE,"position":0.0,"notional":0.0,
+            "qty":0.0,"feasible":False,"fail":"bad_input","reason":"invalid_data","lev_plan":None}
 
 
-# 调仓阈值：仓位相对变化超过这个比例才算"需要操作"。
-# 不是为了省钱而设的——是为了不因为 0.3% 的仓位抖动就下一单。
-REBALANCE_THRESHOLD = 0.05
+REBALANCE_THRESHOLD = strategy.SOFT_REBALANCE
 
 
 def order_decision(equity, price, target_pos, held=None):
-    """
-    统一的「要不要下单」判定 —— 主流程和归档都用这一个，
-    避免两套门限打架（绝对 20U vs 相对 5%）。
-
-    返回 (do_order, dq, minq, tgt_q)
-      do_order : True/False/None（None = 没读到持仓，无法判定）
-      dq       : 建议下单量（数量，带符号；未取整前）
-      minq     : 本次适用的最小下单量（数量）
-      tgt_q    : 目标数量（按步长取整）
-
-    门限 = max(步长, MIN_NOTIONAL/价格, 权益×SOFT_REBALANCE_PCT/价格)
-    """
-    _step = 0.001
-    if not equity or equity <= 0 or not price or price <= 0:
-        return None, 0.0, 0.0, 0.0
-    _soft = SOFT_REBALANCE_PCT * equity / price
-    minq = max(_step, MIN_NOTIONAL / price, _soft)
-    minq = float(np.ceil(minq / _step) * _step)
-    tgt_q = float(np.round(equity * target_pos / price / _step) * _step)
-    if held is None:
-        return None, 0.0, minq, tgt_q
-    _d = tgt_q - held
-    dq = float(np.round(abs(_d) / _step) * _step * (1 if _d > 0 else -1))
-    return bool(abs(dq) >= minq - 1e-9), dq, minq, tgt_q
+    state = None if held is None else PositionState(long_qty=max(0,held),short_qty=max(0,-held))
+    plan = plan_order(equity,price,target_pos,state,current_rules(),available=equity)
+    dq = plan.quantity if plan.side=="BUY" else -plan.quantity
+    return (None if held is None else plan.actionable),dq,plan.min_order_qty,plan.target_qty
 
 
-def decide_action(sig_long, prev_long, tgt_pos, rows, do_order=None,
-                   today=None):
-    """
-    决定归档里的 action。
-
-    ⚠️ 这里曾经写错过：以为"只有信号切换才需要操作"。
-       那个说法只对【固定版】成立（仓位恒定）。
-       波动率目标版的仓位每天都不一样 —— 实测 781 天需要调仓，
-       而信号切换只有 124 天，漏报 84%。
-
-    现在：
-      · 信号切换          →  买入 / 卖出
-      · 信号没切换但在场   →  仓位变了就写"调仓"，没变写"不动"
-      · 不在场            →  不动
-    """
-    if prev_long is None:
-        return "建仓" if sig_long else "不动"
-    if bool(sig_long) != bool(prev_long):
-        return "买入" if sig_long else "卖出"
-    if not sig_long:
-        return "不动"
-    # ⚠️ 2026-10-08 修复：优先用【主流程的实际判定】——
-    #    原来这里用 REBALANCE_THRESHOLD(5% 相对) 判断，
-    #    而主流程用 MIN_NOTIONAL(20U 绝对) ⇒ 两者会矛盾：
-    #        77U    ⇒ 归档标"调仓" 524 天，实际只需下单 117 天（高估 4.5 倍）
-    #        1000U+ ⇒ 反过来，归档低估（矛盾 A 238~577 天）
-    #    ⇒ 现在以主流程为准（那才是"要不要下单"的真相）
-    if do_order is not None:
-        return "调仓" if do_order else "不动"
-    # 回退路径（没有主流程结果时）：仍用相对门限
-    prev_pos = None
-    for r in reversed(rows):
-        # ⚠️ 2026-10-08 修复：跳过【当天自己】的行 ——
-        #    重复跑 --archive 时归档里已经有当天那行，
-        #    不跳过的话 prev_pos 会取到自己 ⇒ chg=0 ⇒ 误判「不动」
-        #    （实测：10-07 目标从 2.9955 → 1.8745，应为「调仓(+37%)」，
-        #      但重复跑时输出了「不动」）
-        if today and (r.get("date") or "") == today:
-            continue
-        v = (r.get("target_position") or "").strip()
-        if v:
-            try:
-                prev_pos = float(v)
-            except ValueError:
-                prev_pos = None
-            break
-    if prev_pos and prev_pos > 0:
-        chg = abs(tgt_pos - prev_pos) / prev_pos
-        if chg > REBALANCE_THRESHOLD:
-            return f"调仓({chg*100:+.0f}%)"
-    return "不动"
+def decide_action(sig_long, prev_long, tgt_pos, rows, do_order=None, today=None, order=None):
+    if order is not None: return order.action
+    if do_order is False: return "不动"
+    if do_order is True: return "调仓"
+    return "未查持仓"
 
 
-# ══════════════════ 主流程 ══════════════════
 def run(a):
     from binance_api import BN
     bn = BN()
+    # ⚠️ 2026-10-08 P0a：先加载交易所规则（MIN_NOTIONAL/stepSize 动态化）
+    _rules_src = load_exchange_rules(bn)
     L = []
     A = L.append
 
-    bars, fixed, st = refresh(bn)
-    bars, note = complete_bars(bars)
+    server_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
+    bars, fixed, st = refresh(bn,now_ms=server_ms)
+    bars, note = complete_bars(bars,server_ms)
+    if not st["ok"]:
+        return f"⛔ 行情刷新失败，暂停建议：{st['err']}", None
+    validate_bars(bars)
+    validate_bars(bars[-max(MA_WINDOW,VOL_WINDOW+1):],continuous=True)
+    if bars[-1]["t"] != (server_ms//86400000-1)*86400000:
+        return "⛔ 缺少最近已完成 UTC 日线，暂停建议", None
     # ⚠️ 数据连续性检查（2026-10-07 加）——
     #    波动率窗口内若漏掉一天大跌，波动率会虚低 ⇒ 仓位偏大 ⇒ 过度杠杆。
     #    这是唯一指向【危险方向】的失效，所以必须显式拦住。
@@ -985,11 +516,17 @@ def run(a):
         A(f"     缓存 {len(bars)} 根，MA{MA_WINDOW} 至少需要 {MA_WINDOW} 根")
         A(f"     （{note}）")
         return "\n".join(L), None
-    fday = funding_by_day()
+    try:
+        fday = funding_by_day()
+    except Exception as error:
+        return f"⛔ 资金费缓存不可用，暂停建议：{type(error).__name__}", None
 
     now = dt.datetime.now()
     bd = dt.datetime.fromtimestamp(sig["bar_t"] / 1000, dt.UTC)
-    price = float(bn.fapi("/fapi/v1/ticker/price", {"symbol": SYM}, signed=False)["price"])
+    ticker = bn.fapi("/fapi/v1/ticker/price", {"symbol": SYM}, signed=False)
+    if ticker.get("symbol",SYM)!=SYM: raise DataError("实时价格标的错误")
+    price = finite(ticker["price"],"实时价格",0)
+    if price<=0: raise DataError("实时价格必须为正")
 
     A("=" * 78)
     A(f"  {SYM} MA{MA_WINDOW} 趋势信号  "
@@ -1003,6 +540,9 @@ def run(a):
     A("  体检")
     A("  " + "-" * 74)
     A(f"  [数据] {note}")
+    A(f"  [规则] 最小名义 {MIN_NOTIONAL:.0f}U / 步长 {STEP_SIZE}"
+      f" / 市价上限 {MARKET_MAX_QTY:g} ETH"
+      f"   （{EXCHANGE_RULES_SRC}）")
     # ⚠️ 连续性检查结果（窗口内缺口 = 危险方向）
     if gaps:
         if gap_in_win:
@@ -1045,880 +585,323 @@ def run(a):
 
     # ── 信号 ──
     A("  信号")
-    A("  " + "-" * 74)
-    A(f"  决策日（已走完的日线）  {bd:%Y-%m-%d} UTC")
-    A(f"  该日收盘                {sig['close']:,.2f}")
-    A(f"  MA{MA_WINDOW}                    {sig['ma50']:,.2f}")
-    A(f"  距 MA{MA_WINDOW}                {sig['dist_pct']:+.2f}%")
-    A("")
-    if sig["long"]:
-        A(f"  收盘 > MA{MA_WINDOW}   ⇒   **做多**"
-          f"（具体仓位见下面「该下多少」——它随本金变，不是固定值）")
-    else:
-        A(f"  收盘 ≤ MA{MA_WINDOW}   ⇒   **空仓**")
-    if sig["prev_long"] is not None and sig["prev_long"] != sig["long"]:
-        A(f"  ⚠️ 状态切换：上一日 {'多' if sig['prev_long'] else '空'}"
-          f" → 今日 {'多' if sig['long'] else '空'}  ⇒ 需要下单")
-    else:
-        # ⚠️ 这里不能只说"无需操作"。波动率目标版的仓位每天都变，
-        #    信号没切换也可能需要调仓（实测 84% 的日子需要）。
-        #    仓位是否要调，要读到账户才知道 —— 见下面「该下多少」段。
-        A(f"  （信号与上一日一致）")
-        if a.check or a.archive:
-            A(f"     ↓ 但仓位是否要调，要看账户 —— 见下面「该下多少」")
-        else:
-            A(f"     ⚠️ 加了 --check 才能算出今天该持多少（仓位随本金和波动变）")
-    A(f"  实时价 {price:,.2f}（仅参考，判定不用）")
+    A(f"  决策日 {bd:%Y-%m-%d} UTC  收盘 {sig['close']:,.2f}  MA50 {sig['ma50']:,.2f}")
+    A(f"  趋势：{'高于' if sig['trend_long'] else '不高于'} MA50；10 日年化波动 {sig['rvol']*100:.1f}%")
+    A(f"  有效信号：{'做多' if sig['long'] else '空仓'}")
+    if sig["reason"]=="vol_cap": A("  波动率超过 120% 上限，主动空仓；这不是数据错误")
+    A(f"  实时价 {price:,.2f}")
     A("")
 
-    # ── 成本 ──
-    # ⚠️ 这里要分清两个日子：
-    #   决策日  = 信号所用的那根日线（收盘在 00:00 UTC）
-    #   持有第1天 = 决策日的次日（资金费在次日 00:00 结算第一次）
-    #   上一版显示的是【决策日】的费率，但实际要付的是【次日】的。
-    #   两者可以差很多，所以两个都列出来，并标明哪个是实际成本。
-    d_sig = int(sig["bar_t"] // 86400000)
-    d_next = d_sig + 1
-    f_sig = fday.get(d_sig)
-    f_next = fday.get(d_next)
+    # ── 成本：仅展示已结算信息，未来资金费不是已知值 ──
+    d_sig = int(sig["bar_t"]//86400000); d_next = d_sig+1
+    f_sig, f_next = fday.get(d_sig), fday.get(d_next)
+    counts = funding_settle_count()
     A("  成本")
-    A("  " + "-" * 74)
-    A(f"  手续费（往返）           {FEE_PER_SIDE*2*100:.3f}%")
-    # ⚠️ 2026-10-07 审计修复：资金费每天 3 次（00:00/08:00/16:00），
-    #    但当天可能只结算了 1~2 次 ⇒ 直接用当日合计会【低估成本】。
-    #    实测：在 UTC 00:05（推荐使用时点）只有 1 次 ⇒ 只有真实值的 36%。
-    #    ⇒ 结算次数 < 3 时改用【最近完整日的均值】，并标注为估计。
-    _cnt = funding_settle_count()
-
-    def _n_settle(d):
-        return _cnt.get(d, 0)
-
-    # 估计方法选择（2026-10-07 实测）：
-    #   资金费的【1 天滞后自相关 = 0.80】很强
-    #   实测 6 种估计法的 MAE（bp）：
-    #       昨天日合计          1.766   ← 最好（−29.8%）
-    #       线性回归(250天)      2.246
-    #       30 天均值（原用）     2.514
-    #   ⇒ 改用【昨天的日合计】，而不是 30 天均值
-    _full_days = sorted(k for k, v in _cnt.items() if v >= 3)
-    _recent = [_full_days[-1]] if _full_days else []
-    _avg = (fday[_recent[-1]] if _recent
-            else (sum(fday[k] for k in _full_days[-30:]) / len(_full_days[-30:])
-                  if len(_full_days) >= 5 else None))
-    _avg30 = (sum(fday[k] for k in _full_days[-30:]) / len(_full_days[-30:])
-              if len(_full_days) >= 5 else _avg)
-
-    if f_sig is not None:
-        n_s = _n_settle(d_sig)
-        tag = "" if n_s >= 3 else f"（{n_s}/3 次，不完整）"
-        A(f"  决策日资金费             {f_sig*100:+.5f}%"
-          f"   {'多头付' if f_sig > 0 else '多头收'}{tag}")
-    if f_next is not None:
-        n_n = _n_settle(d_next)
-        if n_n >= 3 or _avg is None:
-            A(f"  次日资金费（实际成本）    {f_next*100:+.5f}%"
-              f"   {'多头付' if f_next > 0 else '多头收'}")
-        else:
-            A(f"  次日资金费（实际成本）    约 {_avg*100:+.5f}%"
-              f"   {'多头付' if _avg > 0 else '多头收'}"
-              f"   ⚠️ 估计值：当天只结算了 {n_n}/3 次")
-            A(f"     · 当前已结算 {f_next*100:+.5f}%（{n_n} 次）")
-            A(f"     · 估计依据：昨天的日合计 {_avg*100:+.5f}%")
-            A(f"       （资金费 1 天滞后自相关 0.80，用昨天比 30 天均值准 30%）")
-            A(f"     · 当天共 3 次（UTC 00:00 / 08:00 / 16:00）")
-        if sig["long"]:
-            # 用【完整值】（结算不足 3 次时用均值估计）
-            _fn = (f_next if (f_next is not None and _n_settle(d_next) >= 3)
-                   else (_avg if _avg is not None else (f_next or 0.0)))
-            _tot = FEE_PER_SIDE * 2 * 100 + _fn * 100
-            _mark = "" if (_n_settle(d_next) >= 3 or _avg is None) else "  ⚠️ 资金费是估计值"
-            A(f"  ⇒ 持有第 1 天的毛成本     {_tot:.4f}%"
-              f"{_mark}")
-        else:
-            A(f"  ⇒ 空仓，无成本")
-    else:
-        A(f"  次日资金费               还没结算（下一根日线走完才有）")
+    A(f"  手续费参考：单边 {FEE_PER_SIDE*100:.3f}% 名义；账户实际费率在数量验证时读取")
+    if f_sig is not None: A(f"  决策日资金费已结算合计 {f_sig*100:+.5f}%（{counts.get(d_sig,0)} 次）")
+    if f_next is not None: A(f"  当前持有日已结算合计 {f_next*100:+.5f}%（{counts.get(d_next,0)} 次；当天可能未完成）")
+    A("  每次资金费由该结算时点的持仓承担；00:00 调整前持仓与调整后持仓须区分")
+    A("  未来资金费和成交滑点未知，上述日合计不是你的实际账户费用")
     A("")
 
-    # ── 执行建议 ──
-    eq = None
-    # ⚠️ realized_vol 的注释说「截至第 i-1 根收盘」—— 那是对 weight[i] 正确。
-    #    但 net[i] = lag(w)[i] × r[i] = w[i-1] × r[i]，
-    #    而 w[i-1] 用的是 vol20[i-1] = r[i-21:i-1].std()，
-    #    即【截至第 i-2 根收盘】的窗口。差一天，容易被误读成滚动一天。
-    #    （这个歧义曾让一份外部复核多滞后一天，得到 −41.3% 而非 −32.5%。）
-    rvol = realized_vol(bars, VOL_WINDOW)   # V2 用 10 日窗口
-    # 兜底默认值。读账户失败时 eq 为 None，归档里的建议字段是空的，
-    # 所以这些默认值只影响 decide_action 的判断，不影响下单量。
-    #
-    # ⚠️ adv 必须【显式初始化】。它原来只在 if 块里赋值，靠 `if eq` 短路
-    #    才没在归档那行崩掉 —— 那是"靠巧合正确"，不是正确。
-    tgt_pos = LEVERAGE
-    adv = {"method": "", "target_vol": None, "sharpe": METHODS[0][3],
-           "drawdown": METHODS[0][4], "position": 0.0, "notional": 0.0,
-           "qty": float("nan"), "feasible": False, "fail": "no_account",
-           "next": None, "gap": None, "need_equity": float("inf"),
-           "worst": 0.0, "threshold": METHODS[0][2]}
-    # --archive 也需要权益（归档要求记 qty / notional / equity_before），
-    # 所以读账户的条件是 check 或 archive，不只是 check。
+    # ── 执行建议：唯一 OrderPlan 同时供显示和归档使用 ──
+    eq = None; held = None; state = None; tgt_pos = 0.0
+    rvol = sig["rvol"]
+    adv = {"method":"","target_vol":TARGET_VOL_OVERRIDE,"position":0.0,"notional":0.0,"qty":0.0,"reason":sig["reason"]}
+    plan = OrderPlan("hold","未读取账户")
+    account_checked = False
     if a.check or a.archive:
-        # 读账户单独一个 try：失败只影响账户段，不会吞掉"该下多少"的显示
+        plan = OrderPlan("blocked","账户或持仓尚未验证")
         try:
             acct = bn.futures_account()
-            eq = float(acct["totalMarginBalance"])
-            pos = [p for p in bn.positions(SYM) if float(p.get("positionAmt", 0)) != 0]
-            A("  账户（API 实测）")
-            A("  " + "-" * 74)
-            A(f"  保证金余额   {eq:>10,.4f} USDT")
-            A(f"  可用余额     {float(acct['availableBalance']):>10,.4f} USDT")
-            for p in pos:
-                A(f"  现有持仓     {p['positionAmt']} @ {float(p['entryPrice']):,.2f}"
-                  f"  浮盈亏 {float(p['unRealizedProfit']):+,.3f}")
-            if not pos:
-                A(f"  现有持仓     无")
-            # 供下面算「该买卖多少」用；空仓时为 0.0
-            held = sum(float(p["positionAmt"]) for p in pos)
-            A("")
-            adv = advice(eq, price, rvol)      # ← 唯一真源
+            if not isinstance(acct.get("multiAssetsMargin"),bool):
+                raise DataError("保证金资产模式未知")
+            if acct["multiAssetsMargin"] is True:
+                raise DataError("多资产保证金模式暂不支持，暂停数量建议")
+            if acct.get("canTrade") is not True:
+                raise DataError("账户交易资格不可用或未知，暂停数量建议")
+            eq = finite(acct["totalMarginBalance"],"权益",0)
+            available = finite(acct["availableBalance"],"可用余额",0)
+            mode = bn.fapi("/fapi/v1/positionSide/dual",signed=True)
+            if not isinstance(mode.get("dualSidePosition"),bool): raise DataError("账户持仓模式未知")
+            state = parse_positions(bn.positions(SYM),mode["dualSidePosition"])
+            held = state.long_qty
+            commission = bn.fapi("/fapi/v1/commissionRate",{"symbol":SYM},signed=True)
+            fee = finite(commission["takerCommissionRate"],"市价手续费",0)
+            if commission.get("symbol")!=SYM: raise DataError("手续费标的错误")
+            adv = advice(eq,price,rvol,trend_long=sig["trend_long"],fee=fee)
             tgt_pos = adv["position"]
-            mname, tv, msr, mdd = (adv["method"], adv["target_vol"],
-                                   adv["sharpe"], adv["drawdown"])
-            A("  该下多少（按本金自动匹配版本）")
-            A("  " + "-" * 74)
-            if rvol is not None and np.isfinite(rvol):
-                A(f"  {VOL_WINDOW} 日已实现波动   {rvol*100:.1f}%  （波动率目标版要用）")
-                A("")
-            _tag = "（--target-vol 强制）" if TARGET_VOL_EXPLICIT else ""
-            A(f"  账户权益 {eq:,.2f} USDT  ⇒  匹配版本：**{adv['method']}**{_tag}")
-            if TARGET_VOL_OVERRIDE is not None and eq < adv["threshold"]:
-                A(f"     ⚠️ 但权益 {eq:,.2f}U < 该档门槛 {adv['threshold']:.1f}U"
-                  f"（差 {adv['threshold']-eq:,.2f}U）")
-                A(f"        ⇒ 该档在低波动时会算不出最小单，可能需要在"
-                  f"「目标数量」为 0 时手动跳过")
-            if adv["target_vol"] is not None:
-                A(f"     （目标波动率是【在场时】的；账户整体约 "
-                  f"{adv['target_vol']*VOL_ACHIEVE*100:.0f}%"
-                  f" —— 因为约 45% 时间空仓）")
-            A(f"     门槛阶梯：" + "  ".join(
-                f"{mm[0]}≥{mm[2]:.1f}U" for mm in METHODS))
-            if eq < METHODS[0][2]:
-                A(f"     ⚠️ 低于最低门槛 —— 现在开不出单")
-                A(f"     还差 {adv['gap']:,.2f} U 到 {METHODS[0][2]:.1f} USDT")
-            elif adv["next"] is not None:
-                nx = adv["next"]
-                A(f"     到 {nx[2]:.1f} USDT 可升级到「{nx[0]}」"
-                  f"（还差 {adv['gap']:,.2f} U）—— 夏普 {nx[3]:.3f}，回撤 {nx[4]*100:.1f}%")
-            else:
-                # ⚠️ 2026-10-07：V2 默认锁 60% 档，而 60% 是【风险最高】的一档
-                #    （回撤 −54.3%），不是"回撤最小"。原文案在强制档位下误导。
-                if TARGET_VOL_OVERRIDE is not None:
-                    _m = [x for x in METHODS
-                          if x[1] == TARGET_VOL_OVERRIDE] or [METHODS[1]]
-                    A(f"     ⚠️ 已锁定 {TARGET_VOL_OVERRIDE*100:g}% 档"
-                      f"（不会自动升档）")
-                    A(f"        · 这是【风险最高、收益也最高】的一档"
-                      f"（回撤约 {abs(_m[0][4])*100:.1f}%）")
-                    A(f"        · 想降风险用 --target-vol 25 或 15"
-                      f"（但年化会大幅下降）")
-                else:
-                    A(f"     已是最高档（回撤最小的一版）")
-            A("")
-            if adv["target_vol"] is None:
-                A(f"  目标仓位 = max(1.0, {MIN_NOTIONAL:.0f} ÷ {eq:,.2f}) "
-                  f"= {tgt_pos:.3f}x")
-                A(f"     （固定版：权益 < {MIN_NOTIONAL:.0f}U 时被迫超过满仓，"
-                  f">= {MIN_NOTIONAL:.0f}U 后回到 1.0x）")
-            else:
-                A(f"  目标仓位 = min({MAX_POS:.4f}, {adv['target_vol']*100:.0f}% ÷ "
-                  f"{rvol*100:.1f}%) = {tgt_pos:.3f}x")
-            tgt_n = adv["notional"]
-            A(f"  目标名义 = {eq:,.2f} × {tgt_pos:.3f} = {tgt_n:,.2f} USDT")
-            A(f"  目标数量 = {tgt_n:,.2f} ÷ {price:,.2f} = {adv['qty']:.4f} ETH")
-            # ── 币安的下单约束：stepSize 0.001，且名义 ≥ MIN_NOTIONAL ──
-            _step = 0.001
-            # ⚠️ 2026-10-08：改用统一的 order_decision（含软约束）
-            _do, _dq_raw, _minq, _tgt_q = order_decision(
-                eq, price, tgt_pos, held if held is not None else None)
-            A(f"  最小名义 = {MIN_NOTIONAL:.0f} USDT"
-              f"   ⇒ 最小下单 {_minq:.3f} ETH（步长 {_step}）")
-            A(f"  目标数量（按步长取整）= {_tgt_q:.3f} ETH"
-              f"   （原值 {adv['qty']:.4f}，差 {_tgt_q-adv['qty']:+.4f}）")
-            # 若读到持仓，直接给出该买卖多少
-            if held is not None:
-                _delta = _tgt_q - held
-                _dq = _dq_raw
-                A("")
-                if not _do:
-                    A(f"  现有持仓 {held:.3f} ETH   差额 {_delta:+.4f} ETH")
-                    A(f"  ✅ 差额 < 最小下单 {_minq:.3f} ⇒ 【不用动】")
-                else:
-                    A(f"  现有持仓 {held:.3f} ETH   差额 {_delta:+.4f} ETH")
-                    A(f"  ⇒ 【{'买入' if _dq > 0 else '卖出'} {abs(_dq):.3f} ETH】"
-                      f"（差额已取到 {_step} 的整数倍）")
-                    A(f"     下完单后持仓 = {held + _dq:.3f} ETH"
-                      f"（目标 {_tgt_q:.3f}，差 {held+_dq-_tgt_q:+.4f}）")
-            A("")
-            if adv["fail"] == "below_min":
-                A(f"  ❌ 权益低于最低门槛，开不出单")
-                A(f"     最低门槛 {METHODS[0][2]:.2f} USDT"
-                  f"（最小名义 {MIN_NOTIONAL:.0f}U 都下不了）")
-                A(f"     你现在 {eq:.2f} —— 差 {METHODS[0][2]-eq:+.2f}")
-                A(f"     ⚠️ 不要为了凑够名义去提高杠杆 —— 那只会让强平更近。")
-            elif adv["fail"] == "vol":
-                A(f"  ❌ 算不出目标仓位：已实现波动无效（{rvol!r}）")
-                A(f"     ⇒ 这是【数据问题】，不是本金不够。不要下单，下次再跑。")
-            elif adv["fail"] == "notional":
-                A(f"  ❌ 名义不足，开不出单")
-                A(f"     这一版需要权益 ≥ {adv['need_equity']:.2f} USDT"
-                  f"（最小名义 ÷ {tgt_pos:.3f}）")
-                A(f"     你现在 {eq:.2f} —— 差 {adv['need_equity']-eq:+.2f}")
-            elif adv["fail"]:
-                A(f"  ❌ 目标仓位为 0，无法下单")
-            else:
-                A(f"  ✅ 可下单")
-            # ── 币安实际怎么设（杠杆只允许整数）──
-            lp = adv.get("lev_plan")
-            if lp and adv["feasible"]:
-                A("")
-                A(f"  币安实际怎么设（杠杆只能设整数）")
-                A(f"   {'-' * 70}")
-                A(f"   名义价值   {tgt_n:,.2f} USDT   ← 由仓位决定，与杠杆设置无关")
-                A(f"   杠杆设置   {lp['lev']}x          "
-                  f"（= ceil({tgt_pos:.4f})，币安只允许整数）")
-                A(f"      ⚠️ 逐仓下杠杆【只能调高不能调低】—— 已有持仓时降不回去")
-                A(f"         · 首次设好之后不要每天改；只在工具说开不出来时才调高")
-                A(f"         · 若现在已经是更高杠杆，【保持不动即可】")
-                A(f"         · 杠杆比算出值更高不影响盈亏（盈亏由仓位决定），")
-                A(f"           只让强平更近 —— ≤{MAX_SAFE_LEV}x 都安全")
-                A(f"         · 反过来，杠杆低于仓位会【开不出来】"
-                  f"（保证金 = 名义 ÷ 杠杆 ≤ 权益）")
-                A(f"   保证金占用 {lp['margin']:,.2f} USDT   富余 {lp['spare']:,.2f} USDT")
-                A(f"   逐仓强平   标的 {lp['liq_iso_px']*100:>5.1f}%   "
-                  f"账户 {lp['liq_iso_acc']*100:>6.1f}%")
-                A(f"   全仓强平   标的 {lp['liq_cross_px']*100:>5.1f}%   "
-                  f"账户 {lp['liq_cross_acc']*100:>6.1f}%")
-                A("")
-                # ⚠️ V2 修正：旧版这里写「62 笔最坏逆向 −26.6%」——
-                #    那是**相对信号入场价**算的，不是**相对加权开仓价**。
-                #    加权开仓价口径下，最坏盘中逆向是 −48.6%（2021-05-19），
-                #    因为前几天持续加仓把成本推高了。
-                #    ⇒ 3x 的 −32.9% 挡不住它，旧版的「不会触发强平」是错的。
-                #    V2 改用「波动率上限 120%」解决（实测强平 2 次 → 0 次）。
-                A(f"   62 笔交易的期间最坏逆向   {WORST_TRADE_LOW*100:.1f}%"
-                  f"（相对信号入场价）")
-                A(f"   同口径换成加权开仓价的最坏值   −48.6%（2021-05-19）")
-                if lp["safe"]:
-                    A("   ✅ 当前配置实测 0 次强平 —— 靠的是 V2 的波动率上限")
-                    A(f"      · 3x 的强平线是标的 {lp['liq_iso_px']*100:.1f}%，"
-                      f"而历史最坏盘中逆向 −58.5% 会穿过它")
-                    A(f"      · 但 V2 在 10 日波动 > {VOL_CAP*100:.0f}% 时强制空仓，"
-                      f"正好避开那几次")
-                    A("      · 实测：无上限强平 2 次 → 有上限 0 次")
-                    A("      ⚠️ 但瞬间跳变（波动率从 20% 直接跳到 130%）仍可能打穿")
-                else:
-                    A(f"   ❌ 逐仓【会被强平】：强平线 {lp['liq_iso_px']*100:.1f}% "
-                      f"比最坏单笔({WORST_TRADE_LOW*100:.1f}%)更近")
-                    A(f"      杠杆设置 {lp['lev']}x 太高 —— 降到 {MAX_SAFE_LEV}x 以下")
-                A(f"   触发强平后剩多少：逐仓 {eq - lp['liq_iso_px']*tgt_n:.2f}U"
-                  f"   全仓 {eq - lp['liq_cross_px']*tgt_n:.2f}U")
-                # ⚠️ 2026-10-07 审计加：把「强平距离」和「历史最坏单日」放在一起看，
-                #    但要讲清它们不是同一个风险 —— 极端单日发生时波动率都很高，
-                #    仓位很小；真正危险的是「低波动 + 突然暴跌」。
-                _liqd = lp["liq_iso_px"]
-                _worst1d = 0.585          # 2021-05-19 的单日跌幅（最低/前收）
-                if _liqd < _worst1d:
-                    A(f"   ⚠️ 强平距离（标的 {_liqd*100:.1f}%）"
-                      f"【小于】历史最坏单日跌幅（{_worst1d*100:.1f}%）")
-                    A(f"      · 但那次（2021-05-19）前日波动 200.8% ⇒ "
-                      f"波动率上限已强制空仓，不在场")
-                    A(f"      · 唯一没被上限拦下的是 2021-09-07（前日波动 119.2%），"
-                      f"但那时仓位仅 0.503x ⇒ 1x 杠杆 ⇒ 安全")
-                    A(f"      · ⇒ 真正的残余风险是「低波动（当前 {rvol*100:.1f}%，"
-                      f"仓位大）+ 当天突然暴跌」——历史上从未发生")
-                    A(f"      · 想彻底消除就用 --target-vol 25（最高 2.13x）"
-                      f"或每天追加保证金")
-                else:
-                    A(f"   ✅ 强平距离（标的 {_liqd*100:.1f}%）"
-                      f"大于历史最坏单日跌幅（{_worst1d*100:.1f}%）")
-                A(f"      ⇒ 逐仓【账户下限更高】（亏掉保证金就停，不会穿仓）")
-            A("")
-            A(f"  历史表现（ETHUSDT 日线 {SAMPLE_DAYS + 60} 根，"
-              f"回测样本 {SAMPLE_DAYS} 天 = {SAMPLE_YEARS:.2f} 年，扣全部成本）：")
-            A(f"     夏普 {adv['sharpe']:.3f}")
-            A("")
-            A("     ① 恒定杠杆口径（保守，回答【最坏能坏到哪】）")
-            A(f"        按 {tgt_pos:.3f}x：最大回撤 {adv['drawdown']*100:.1f}%"
-              f"   ⇒ 若起点即峰值，跌到 {adv['worst']:,.2f} U")
-            _dd = dynamic_drawdown(bars, fday, eq)
-            if _dd:
-                A("")
-                A(f"     ② 从你 {eq:,.2f} U 出发的真实路径"
-                  f"（回答【历史上真的到过哪】）")
-                A(f"        最大回撤 {_dd['dd']*100:.1f}%   "
-                  f"路径最低 {_dd['low']:,.2f} U   峰值 {_dd['peak']:,.2f} U")
-                if _dd.get("switches"):
-                    A(f"        版本切换 {_dd['switches']} 次"
-                      f"（权益变化时自动升/降档）")
-                A(f"        ⇒ 历史上从没跌到过 {adv['worst']:,.2f} U —— "
-                  f"那是【起点即峰值】的假设值")
-            A("")
-        except Exception as e:
-            A(f"  ⚠️ 读账户失败：{type(e).__name__}: {e}")
-            A("")
+            if adv.get("fail")=="bad_input": raise DataError("仓位输入无效")
+            pending = validate_pending_orders(bn)
+            plan = plan_order(eq,price,tgt_pos,state,current_rules(),available,fee)
+            account_checked = True
+            A("  账户与调仓")
+            A("  ETHUSDT 未成交委托：普通0、条件0（已查询两个接口）")
+            A(f"  权益 {eq:.4f} USDT；可用保证金 {available:.4f} USDT")
+            A(f"  {'双向' if state.hedge else '单向'}模式；多仓 {held:.3f} ETH；空仓 {state.short_qty:.3f} ETH")
+            A(f"  目标仓位 {tgt_pos:.4f}x；目标持仓 {format_qty(plan.target_qty)} ETH")
+            A(f"  普通双向调仓门限 {strategy.SOFT_REBALANCE:.0%} 权益 = {eq*strategy.SOFT_REBALANCE:.4f} USDT（取整后的本次交易名义）")
+            A(f"  ETHUSDT 最小名义 {MIN_NOTIONAL:g}U；数量步长 {STEP_SIZE:g}；市价数量上限 {MARKET_MAX_QTY:g}")
+            if plan.actionable:
+                verb = "买入（开多/加多）" if plan.side=="BUY" else ("卖出（平多）" if plan.target_qty==0 else "卖出（减多）")
+                A(f"  ⇒ 【{verb} {format_qty(plan.quantity)} ETH】")
+                A(f"     方向 {plan.position_side}；{'仅减仓' if plan.reduce_only else '按指定持仓方向操作'}")
+                A(f"     数量已向下按步长取整；保证金和手续费已核对；实际成交前仍应核对价格")
+            elif plan.status=="blocked": A(f"  ⛔ 暂停建议：{plan.reason}")
+            else: A(f"  ⇒ 【不用动】（{plan.reason}）")
+            A(f"  策略增仓要求：逐仓、3x；当前 {state.margin_type}、{state.leverage}x")
+            if state.liquidation_price>0:
+                A(f"  当前 API 强平价 {state.liquidation_price:,.2f}；相对当前价 {(state.liquidation_price/price-1)*100:+.1f}%")
+            A("  波动率上限不能保证避免突发暴跌或未来强平；低波动下任何档位均可能接近 3x")
+        except Exception as error:
+            plan = OrderPlan("blocked",f"账户依赖失败：{type(error).__name__}: {error}")
+            A(f"  ⛔ 暂停建议：{plan.reason}")
+        A("")
 
     # ── 规则提醒 ──
-    A("  规则（来自 ma50_rules.md）")
-    A("  " + "-" * 74)
-    A(f"  · 只用日线、只做多。在场开关永远是「日线收盘 > MA50」")
-    A(f"  · 每天 UTC 00:00 后检查一次，用【已走完】那根的收盘")
-    A(f"  · 不做量比/资金费筛选（实测无增量）")
-    A(f"  · 仓位大小按本金自动匹配（见上）：本金越大，能用的版本回撤越小")
-    A(f"  · 门槛来自实测：20U 最小名义 ÷ 有仓位日第 10 分位仓位")
-    A(f"  · 夏普的标准误 {SE_SHARPE:.3f} —— {SAMPLE_YEARS:.2f} 年样本，很不精确")
-    A("")
-    A("  ⚠️ 别手动优化进出场。这套东西的全部价值来自规则化。")
+    A("  每天 UTC 00:00 后读取完成日线；只做多；默认目标波动 60%")
+    A(f"  普通加减仓门限均为权益 {strategy.SOFT_REBALANCE:.0%}；新开仓、目标归零或持仓名义超过3倍权益时不受软门限限制")
+    A("  减仓不使用增仓的最小名义门限；双向持仓模式必须明确 LONG")
+    if st.get("fund_err"): A(f"  ⚠️ 资金费刷新失败，成本数据未验证：{st['fund_err']}")
+    A("  历史统计使用日线开盘价近似成交与逐次资金费；不构成真实成交或零强平验证")
     A("")
 
     rec = {
-        "symbol": SYM,
-        "date": bd.strftime("%Y-%m-%d"),
-        "bar_ms": str(sig["bar_t"]),
-        "bar_close": f"{sig['close']:.2f}",
-        "ma50": f"{sig['ma50']:.2f}",
-        "dist_ma50_pct": f"{sig['dist_pct']:.2f}",
-        "signal": "做多" if sig["long"] else "空仓",
-        "action": decide_action(sig["long"], sig["prev_long"], tgt_pos,
-                                load_archive(),
-                                do_order=order_decision(eq, price, tgt_pos,
-                                                        held)[0]
-                                if (eq and price) else None,
-                                today=bd.strftime("%Y-%m-%d")),
-        "advice_qty": f"{(eq*tgt_pos/price):.4f}" if eq else "",
-        "advice_notional": f"{eq*tgt_pos:.2f}" if eq else "",
-        "equity_at_signal": f"{eq:.4f}" if eq else "",
-        "method": adv["method"] if eq else "",
-        "target_vol": f"{adv['target_vol']:.2f}"
-                      if (eq and adv["target_vol"] is not None) else "",
-        "target_position": f"{tgt_pos:.4f}" if eq else "",
-        "lev_setting": f"{adv['lev_plan']['lev']}" if (eq and adv.get("lev_plan")) else "",
-        "margin_mode": ("全仓" if (eq and adv.get("lev_plan")
-                                  and adv["lev_plan"]["liq_iso_acc"] > adv["drawdown"])
-                        else ("逐仓" if (eq and adv.get("lev_plan")) else "")),
-        "liq_acc_pct": (f"{adv['lev_plan']['liq_iso_acc']*100:.1f}"
-                        if (eq and adv.get("lev_plan")) else ""),
-        "realized_vol_pct": f"{rvol*100:.2f}" if (eq and np.isfinite(rvol)) else "",
-        "funding_pct_today": f"{f_sig*100:.5f}" if f_sig is not None else "",
-        "funding_pct_next": f"{f_next*100:.5f}" if f_next is not None else "",
-        "entry_ref": f"{sig['close']:.2f}",
-        "fwd_1d": "", "fwd_7d": "", "fwd_10d": "", "fwd_30d": "",
-        "max_dd_10d": "", "checked_at": "", "status": "", "notes": note[:40],
+        "symbol":SYM,"date":bd.strftime("%Y-%m-%d"),"bar_ms":str(sig["bar_t"]),
+        "bar_close":f"{sig['close']:.2f}","ma50":f"{sig['ma50']:.2f}","dist_ma50_pct":f"{sig['dist_pct']:.2f}",
+        "signal":"做多" if sig["long"] else "空仓","trend_signal":"做多" if sig["trend_long"] else "空仓",
+        "decision_reason":sig["reason"],"action":plan.action if account_checked else "未验证",
+        "side":plan.side,"position_side":plan.position_side,"reduce_only":str(plan.reduce_only),
+        "order_qty":f"{format_qty(plan.quantity)}" if plan.actionable else "",
+        "target_qty":f"{format_qty(plan.target_qty)}" if account_checked else "",
+        "validation_status":plan.status if (a.check or a.archive) else "signal_only",
+        "rebalance_policy":"symmetric","soft_rebalance_pct":f"{strategy.SOFT_REBALANCE:.4f}",
+        "advice_qty":f"{format_qty(plan.target_qty)}" if account_checked else "",
+        "advice_notional":f"{plan.target_qty*price:.2f}" if account_checked else "",
+        "equity_at_signal":f"{eq:.4f}" if account_checked else "","method":adv.get("method","") if account_checked else "",
+        "target_vol":f"{adv['target_vol']:.2f}" if account_checked and adv.get("target_vol") is not None else "",
+        "target_position":f"{tgt_pos:.4f}" if account_checked else "","lev_setting":str(state.leverage) if account_checked else "",
+        "margin_mode":state.margin_type if account_checked else "","liq_acc_pct":"",
+        "realized_vol_pct":f"{rvol*100:.2f}","funding_pct_today":f"{f_sig*100:.5f}" if f_sig is not None else "",
+        "funding_pct_next":f"{f_next*100:.5f}" if f_next is not None else "","entry_ref":f"{sig['close']:.2f}",
+        "fwd_1d":"","fwd_7d":"","fwd_10d":"","fwd_30d":"","max_dd_10d":"","checked_at":"","status":"", "notes":plan.reason,
     }
     return "\n".join(L), rec
 
 
-# ══════════════════ 归档 ══════════════════
+@contextmanager
+def archive_lock(timeout=10):
+    import time as clock
+    lock = pathlib.Path(str(ARCHIVE)+".lock");lock.parent.mkdir(parents=True,exist_ok=True)
+    with lock.open("a+b") as f:
+        if f.tell()==0: f.write(b"0"); f.flush()
+        deadline = clock.monotonic()+timeout
+        while True:
+            try:
+                f.seek(0)
+                if os.name=="nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(),msvcrt.LK_NBLCK,1)
+                else:
+                    import fcntl
+                    fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                break
+            except OSError:
+                if clock.monotonic()>=deadline: raise DataError("日志被其他进程占用")
+                clock.sleep(.05)
+        try: yield
+        finally:
+            f.seek(0)
+            if os.name=="nt": msvcrt.locking(f.fileno(),msvcrt.LK_UNLCK,1)
+            else: fcntl.flock(f,fcntl.LOCK_UN)
+
+def _save_archive_unlocked(rows):
+    import io
+    extra = sorted(set().union(*(r.keys() for r in rows))-set(FIELDS)) if rows else []
+    buf = io.StringIO(newline="")
+    writer = csv.DictWriter(buf,fieldnames=FIELDS+extra);writer.writeheader()
+    for row in rows:
+        row = dict(row)
+        if not row.get("validation_status"): row["validation_status"]="legacy_unverified"
+        writer.writerow(row)
+    _atomic_write(ARCHIVE,buf.getvalue(),encoding="utf-8-sig")
+
 def load_archive():
-    if not ARCHIVE.exists():
-        return []
-    return list(csv.DictReader(ARCHIVE.open(encoding="utf-8-sig")))
+    if not ARCHIVE.exists(): return []
+    with ARCHIVE.open(encoding="utf-8-sig",newline="") as f: return list(csv.DictReader(f))
 
 
 def save_archive(rows):
-    ARCHIVE.parent.mkdir(parents=True, exist_ok=True)
-    with ARCHIVE.open("w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS)
-        w.writeheader()
-        for r in rows:
-            w.writerow({k: r.get(k, "") for k in FIELDS})
+    with archive_lock(): _save_archive_unlocked(rows)
 
 
 def do_archive(rec):
-    rows = load_archive()
-    hit = None
-    for i, r in enumerate(rows):
-        if r.get("date") == rec["date"]:
-            hit = i; break
-    if hit is not None:
-        # 保留已回填的前向收益
-        for k in ("fwd_1d", "fwd_7d", "fwd_10d", "fwd_30d",
-                  "max_dd_10d", "checked_at", "status"):
-            if rows[hit].get(k):
-                rec[k] = rows[hit][k]
-        rows[hit] = rec
-        act = "更新"
-    else:
-        rows.append(rec); act = "新增"
-    save_archive(rows)
-    yes = sum(1 for r in rows if r.get("signal") == "做多")
-    print(f"  已{act}：{rec['date']}  {rec['signal']}  共 {len(rows)} 天"
-          f"（其中做多 {yes} 天 / 空仓 {len(rows)-yes} 天）")
+    with archive_lock():
+        rows=load_archive();hit=next((i for i,r in enumerate(rows) if r.get("date")==rec["date"]),None)
+        if hit is not None:
+            for key in ("fwd_1d","fwd_7d","fwd_10d","fwd_30d","max_dd_10d",
+                        "price_return_1d","price_return_7d","price_return_10d","price_return_30d",
+                        "price_drawdown_10d","checked_at","status"):
+                if rows[hit].get(key): rec[key]=rows[hit][key]
+            merged=dict(rows[hit]);merged.update(rec);rows[hit]=merged
+        else: rows.append(rec)
+        rows.sort(key=lambda r:r["date"]);_save_archive_unlocked(rows)
+    print(f"  已归档 {rec['date']}：{rec['signal']} / {rec['action']}")
 
 
 def backfill():
-    rows = load_archive()
-    if not rows:
-        print("  还没有归档。先跑 python ma50_live.py --archive")
-        return
-    from binance_api import BN as _BN      # 模块级不导入，这里按需取
-    bars = load_cache(_BN())               # 与 refresh 同一个安全入口
-    bars, _ = complete_bars(bars)
-    c = {int(b["t"]): i for i, b in enumerate(bars)}
-    filled = partial = failed = pending = 0
-    for r in rows:
-        k = int(r["bar_ms"])
-        if k not in c:
-            r["status"] = "failed"; failed += 1; continue
-        i = c[k]
-        base = float(r["entry_ref"])
-        got = {}
-        for tag, h in (("fwd_1d", 1), ("fwd_7d", 7), ("fwd_10d", 10), ("fwd_30d", 30)):
-            if i + h < len(bars):
-                got[tag] = (bars[i + h]["c"] / base - 1) * 100
-        if i + 10 < len(bars):
-            seg = [bars[j]["c"] for j in range(i, min(i + 11, len(bars)))]
-            r["max_dd_10d"] = f"{(min(seg)/base-1)*100:.2f}"
-        for t, v in got.items():
-            r[t] = f"{v:.3f}"
-        r["checked_at"] = f"{dt.datetime.now():%Y-%m-%d %H:%M}"
-        if len(got) == 4:
-            r["status"] = "complete"; filled += 1
-        elif got:
-            r["status"] = "partial"; partial += 1
-        else:
-            # 决策日之后还没有任何一根走完 —— 这是正常的等待状态，不是失败
-            r["status"] = "pending"; pending += 1
-    save_archive(rows)
-    print(f"  完整回填 {filled} 条   部分 {partial} 条"
-          f"   等待中 {pending} 条   失败 {failed} 条")
-    if pending:
-        print(f"  （「等待中」= 决策日之后还没有 K 线走完，等明天再跑）")
+    from binance_api import BN
+    bn=BN();now_ms=int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
+    bars,_,st=refresh(bn,now_ms);bars,_=complete_bars(bars,now_ms)
+    if not st["ok"]: raise DataError("回填行情刷新失败")
+    validate_bars(bars,continuous=True)
+    if not bars or bars[-1]["t"]!=(now_ms//86400000-1)*86400000:
+        raise DataError("回填缺少最新完成日线")
+    index={int(b["t"]):i for i,b in enumerate(bars)};filled=0
+    with archive_lock():
+        rows=load_archive()
+        for row in rows:
+            try:
+                i=index.get(int(row["bar_ms"]));base=finite(row["entry_ref"],"价格诊断参考价",0)
+            except (ValueError,TypeError,KeyError):
+                row["status"]="failed";continue
+            if i is None or base<=0: row["status"]="failed";continue
+            got=0
+            for h in (1,7,10,30):
+                if i+h<len(bars):
+                    value=f"{(bars[i+h]['c']/base-1)*100:.3f}"
+                    row[f"price_return_{h}d"]=value;row[f"fwd_{h}d"]=value;got+=1
+            if i+10<len(bars):
+                prices=np.array([base]+[bars[j]["c"] for j in range(i+1,i+11)])
+                row["price_drawdown_10d"]=f"{np.min(prices/np.maximum.accumulate(prices)-1)*100:.3f}"
+                # Keep the legacy field as the original lowest-close/from-entry metric.
+                row["max_dd_10d"]=f"{(prices.min()/base-1)*100:.3f}"
+            row["status"]="complete" if got==4 else ("partial" if got else "pending")
+            row["checked_at"]=dt.datetime.now(dt.UTC).isoformat();filled+=got>0
+        _save_archive_unlocked(rows)
+    print(f"  回填 {filled} 条：ETH 价格诊断，不是含成本的策略收益")
 
 
 def history():
-    rows = load_archive()
-    if not rows:
-        print("  还没有归档。先跑 python ma50_live.py --archive")
-        return
-    print()
-    print("=" * 92)
-    print(f"  MA50 归档  {len(rows)} 条")
-    print("=" * 92)
-    days = sorted({r["date"] for r in rows})
-    print(f"  前向检验进度：{len(days)} / 120 天"
-          + ("   OK 够了" if len(days) >= 120 else f"   还差 {120-len(days)} 天"))
-    if len(days) > 1:
-        # ⚠️ 两种缺口要分开查：
-        #   A. 已有记录【之间】的断点（原来只查这个）
-        #   B. 首尾范围内【本该有但没有】的日子
-        #   B 才是最容易发生的 —— 忘了跑 --archive 就会漏，
-        #   而只查 A 的话，漏掉的日子根本不在记录里，永远查不出来。
-        _d0 = dt.datetime.strptime(days[0], "%Y-%m-%d").date()
-        _d1 = dt.datetime.strptime(days[-1], "%Y-%m-%d").date()
-        _expected = {(_d0 + dt.timedelta(days=i)).strftime("%Y-%m-%d")
-                     for i in range((_d1 - _d0).days + 1)}
-        _have = set(days)
-        _missing = sorted(_expected - _have)
-
-        gaps = []
-        for x, y in zip(days[:-1], days[1:]):
-            g = (dt.datetime.strptime(y, "%Y-%m-%d")
-                 - dt.datetime.strptime(x, "%Y-%m-%d")).days
-            if g != 1:
-                gaps.append((x, y, g))
-
-        if _missing:
-            print(f"  🔴 你有 {len(_missing)} 天没归档（这是最容易漏的）")
-            _show = _missing[:6]
-            print(f"       {', '.join(_show)}" + ("  …" if len(_missing) > 6 else ""))
-            print(f"      ⇒ 这些日子没有记录，前向检验永远补不回来")
-            print(f"      ⇒ 每天记得跑：python ma50_live.py --archive")
-        elif gaps:
-            lost = sum(g - 1 for _, _, g in gaps)
-            print(f"  ⚠️ 中间缺了 {lost} 天（{len(gaps)} 处断点）")
-            for x, y, g in gaps[:5]:
-                print(f"       {x} → {y}  跳了 {g} 天")
-        else:
-            print(f"  日期连续，无缺口 ✅")
-        print(f"  （检查范围：{days[0]} ~ {days[-1]}，共 {len(_expected)} 天，"
-              f"有记录 {len(_have)} 天）")
-    print()
-    hdr = (f"  {'日期':<12}{'收盘':>10}{'MA50':>10}{'距离':>8}{'信号':>7}"
-           f"{'动作':>7}{'fwd_10d':>10}{'状态':>10}")
-    print(hdr)
-    print("  " + "-" * (len(hdr) + 2))
-    for r in rows[-25:]:
-        f10 = r.get("fwd_10d") or "—"
-        f10s = f"{float(f10):+.2f}%" if f10 != "—" else "—"
-        print(f"  {r['date']:<12}{float(r['bar_close']):>10,.2f}"
-              f"{float(r['ma50']):>10,.2f}{float(r['dist_ma50_pct']):>+7.2f}%"
-              f"{r['signal']:>7}{r['action']:>7}{f10s:>10}{r.get('status','') or '—':>10}")
-    done = [r for r in rows if r.get("status") == "complete"]
-    if done:
-        long_days = [r for r in done if r["signal"] == "做多"]
-        print()
-        print(f"  已完整回填 {len(done)} 条")
-        if long_days:
-            v = [float(r["fwd_10d"]) for r in long_days if r.get("fwd_10d")]
-            print(f"    「做多」信号的 10 天平均收益 {np.mean(v):+.2f}%  （n={len(v)}）")
-        print(f"    ⇒ 样本还太小，这些数字暂时没有判断力")
+    rows=load_archive()
+    if not rows: print("还没有归档。");return
+    days=sorted({r["date"] for r in rows});legacy=sum(r.get("validation_status") in (None,"","legacy_unverified") for r in rows)
+    print(f"MA50 归档：{len(days)} 天；旧版未验证记录 {legacy} 条")
+    if len(days)>1:
+        first=dt.date.fromisoformat(days[0]);last=dt.date.fromisoformat(days[-1])
+        missing={str(first+dt.timedelta(days=i)) for i in range((last-first).days+1)}-set(days)
+        if missing:print(f"缺少 {len(missing)} 天：{', '.join(sorted(missing)[:8])}")
+    print("日期         有效信号  动作    ETH后10天价格涨跌  状态")
+    for row in rows[-25:]:
+        value=row.get("price_return_10d") or row.get("fwd_10d") or "—"
+        print(f"{row['date']}  {row.get('signal','—')}  {row.get('action','—')}  {value}  {row.get('validation_status','旧版未验证')}")
+    print("价格涨跌未含变仓、手续费或资金费；记录天数不能直接证明策略有效。")
 
 
 def sync_methods():
-    """
-    把 METHODS 表更新为当前实算值，并把 METHODS_ASOF 改成今天。
-
-    ⚠️ 只在 --selfcheck 报「超容差」时跑 —— 它会把当前值写成新基准。
-       口径必须与 selfcheck / run() 完全一致：
-         · complete_bars() 过滤掉未走完的当天（否则前视）
-         · align.panel 算净收益（含手续费与资金费）
-    """
-    import re as _re
-    try:
-        sys.path.insert(0, str(pathlib.Path(__file__).parent))
-        from align import max_dd as _mdd
-        from align import panel as _panel
-        from align import sharpe as _sh
-    except ImportError as e:
-        print(f"  ❌ 找不到 align.py：{e}")
-        return
-    raw = json.loads(CACHE.read_text(encoding="utf-8"))
-    raw, note = complete_bars(raw)              # ⚠️ 必须过滤，否则前视
-    C = np.array([b["c"] for b in raw], float)
-    fd = json.loads(FUND.read_text(encoding="utf-8"))
-    fday = {}
-    for x in fd:
-        k = int(x["t"] // 86400000)
-        fday[k] = fday.get(k, 0.0) + x["rate"]
-    day = np.array([b["t"] // 86400000 for b in raw])
-    FR = np.array([fday.get(int(day[i]), 0.0) for i in range(len(C))])
-    P = _panel(C, FR, FEE_PER_SIDE)
-    W = 60
-    rows = []
-    for name, tv, need, _, _ in METHODS:
-        x = P.net(tv, lev=(LEVERAGE if tv is None else None))[W:]
-        x = x[np.isfinite(x)]
-        sh, dd = _sh(x), _mdd(x)
-        _ar = x.mean() * 365 * 100                       # 算数年化
-        _eq = np.cumprod(1 + x)[-1]                      # 期末倍数
-        _geo = (_eq ** (365 / len(x)) - 1) * 100         # 几何年化
-        w = P.weight(tv)[W:]
-        on = w[w > 0]
-        newneed = need if tv is None else round(20.0 / np.percentile(on, 10), 1)
-        rows.append((name, tv, newneed, round(sh, 4), round(dd, 3),
-                     _ar, _geo, _eq))
-    lines = ["METHODS = ["]
-    for name, tv, need, sh, dd, *_ in rows:
-        tvs = "None" if tv is None else f"{tv}"
-        lines.append(f'    ("{name}",{" " * max(1, 16 - len(name))}{tvs},'
-                     f'{" " * max(1, 10 - len(tvs))}{need:.1f},'
-                     f'{" " * max(1, 9 - len(f"{need:.1f}"))}{sh:.4f}, {dd:.3f}),')
-    lines.append("]")
-    src = pathlib.Path(__file__).read_text(encoding="utf-8")
-
-    # 同步 METHODS 上方的注释表（否则会像 2026-10-07 那样脱节）
-    _tbl = ["#        ┌────────┬────────┬────────┬──────────┬──────────┬────────┬────────┐",
-            "#        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │",
-            "#        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤"]
-    for _n, _tv, _need, _sh, _dd, _ar, _geo, _eq in rows:
-        _lab = "固定版" if _tv is None else f"{_tv*100:.0f}%"
-        _tbl.append(f"#        │ {_lab:^6} │ {_need:>5.1f}U │ {_sh:.4f} │"
-                    f"  {_ar:>5.1f}%  │  {_geo:>5.1f}%  │ {_dd*100:>5.1f}% │"
-                    f" {_eq:>5.1f}x │")
-    _tbl.append("#        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘")
-    # ⚠️ 不要用 re.S + 懒惰量词定位这张表 —— 会指数级回溯（实测卡死）。
-    #    改成按【行前缀】定位。
-    _L = src.split("\n")
-    try:
-        _st = next(i for i, ln in enumerate(_L)
-                   if ln.startswith("#        \u250c"))
-        _en = next(i for i in range(_st, len(_L))
-                   if _L[i].startswith("#        \u2514"))
-        _L[_st:_en + 1] = _tbl
-        src = "\n".join(_L)
-    except StopIteration:
-        pass          # 找不到表就跳过，不阻断 METHODS 的更新
-
-
-    # ⚠️ 2026-10-08 修复：一并更新【所有派生常量】——
-    #    原来只改 METHODS，导致 SAMPLE_DAYS 停留在旧值（实测 2446 vs 实算 2447）。
-    _nd = len(raw) - W
-    _Sd = rows[1][3] / np.sqrt(365)          # 60% 档日夏普
-    _se = float(np.sqrt((1 + _Sd ** 2 / 2) / _nd) * np.sqrt(365))
-    src = _re.sub(r"SAMPLE_DAYS = \d+", f"SAMPLE_DAYS = {_nd}", src, count=1)
-    src = _re.sub(r"SAMPLE_YEARS = [\d.]+", f"SAMPLE_YEARS = {_nd / 365:.2f}",
-                  src, count=1)
-    src = _re.sub(r"SE_SHARPE = [\d.]+", f"SE_SHARPE = {_se:.3f}", src, count=1)
-    print(f"  ✅ 派生常量已更新：SAMPLE_DAYS={_nd}  "
-          f"SAMPLE_YEARS={_nd/365:.2f}  SE_SHARPE={_se:.3f}")
-
-    src = _re.sub(r"METHODS = \[.*?\n\]", "\n".join(lines), src, count=1,
-                  flags=_re.S)
-    today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
-    src = _re.sub(r'METHODS_ASOF = "[^"]*"', f'METHODS_ASOF = "{today}"', src,
-                  count=1)
-    pathlib.Path(__file__).write_text(src, encoding="utf-8")
-    print(f"  ✅ METHODS 已更新（{note}）")
-    for name, tv, need, sh, dd, *_ in rows:
-        print(f"     {name:<18} 门槛 {need:>6.1f}U  夏普 {sh:.4f}  回撤 {dd:.3f}")
-    print(f"  ✅ METHODS_ASOF → {today}")
+    import ast
+    from align import panel,sharpe,max_dd,cagr
+    raw,_=complete_bars(load_cache());validate_bars(raw,continuous=True);funding=load_funding()
+    if any(r["t"]>=raw[60]["t"] and not r.get("markPrice") for r in funding):raise DataError("需先补齐回测持有期资金费标记价格")
+    C=np.array([b["c"] for b in raw]);days=funding_by_day();FR=np.array([days.get(int(b["t"]//86400000),0) for b in raw])
+    P=panel(C,FR,FEE_PER_SIDE,bars=raw,funding=funding);W=60;rows=[]
+    for name,tv,_,_,_ in METHODS:
+        x=P.net(tv,lev=LEVERAGE)[W:];on=P.weight(tv)[W:];on=on[on>0]
+        need=MIN_NOTIONAL/MAX_POS if tv is None else MIN_NOTIONAL/float(np.percentile(on,10))
+        rows.append((name,tv,round(need,1),round(sharpe(x),4),round(max_dd(x),3)))
+        print(f"{name}: 几何年化 {cagr(x)*100:.2f}%；回撤 {max_dd(x)*100:.2f}%；倍数 {np.prod(1+x):.3f}")
+    dd_rows=[(lev,round(max_dd(P.net(None,lev=lev)[W:]),3)) for lev,_ in DD_BY_LEV]
+    replacements={"METHODS":rows,"DD_BY_LEV":dd_rows,"METHODS_ASOF":dt.datetime.now(dt.UTC).strftime("%Y-%m-%d"),
+                  "SAMPLE_DAYS":len(raw)-W,"SAMPLE_YEARS":round((len(raw)-W)/365,2)}
+    path=pathlib.Path(__file__);source=path.read_text(encoding="utf-8");tree=ast.parse(source);lines=source.splitlines(keepends=True)
+    assignments=[n for n in tree.body if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name) and n.targets[0].id in replacements]
+    if len(assignments)!=len(replacements):raise DataError("统计表声明不完整，拒绝修改源码")
+    for n in sorted(assignments,key=lambda n:n.lineno,reverse=True):
+        name=n.targets[0].id;lines[n.lineno-1:n.end_lineno]=[f"{name} = {replacements[name]!r}\n"]
+    updated="".join(lines);updated_tree=ast.parse(updated)
+    if {n.name for n in tree.body if isinstance(n,ast.FunctionDef)}!={n.name for n in updated_tree.body if isinstance(n,ast.FunctionDef)}:
+        raise DataError("统计同步影响到函数，拒绝保存")
+    _atomic_write(path,updated)
+    print("统计表已同步：现金流模型；不含真实滑点和盘中强平验证")
 
 
 def selfcheck():
-    """
-    自检：确认 METHODS 表里的数字和当前代码/数据一致，
-    并确认对齐口径正确（把仓位配到同期收益上是前视，会让夏普虚高 2.3~2.7 倍）。
-
-    为什么需要它：2026-10-06 发现 METHODS 表里的夏普全是前视值，
-    虚高了 2.2~2.3 倍。这个自检就是为了让同类错误下次跑一下就能发现。
-    """
-    import numpy as np
+    from align import panel,sharpe,max_dd
+    errors=[]
     try:
-        sys.path.insert(0, str(pathlib.Path(__file__).parent))
-        from align import panel, sharpe, max_dd, cagr
-    except ImportError as e:
-        print(f"  ❌ 找不到 align.py：{e}")
-        print(f"     它在 {pathlib.Path(__file__).parent}")
-        return
-
-    print()
-    print("=" * 88)
-    print("  ma50_live 自检")
-    print("=" * 88)
-
-    fd = json.loads(FUND.read_text(encoding="utf-8"))
-    fday = {}
-    for x in fd:
-        k = int(x["t"] // 86400000)
-        fday[k] = fday.get(k, 0.0) + x["rate"]
-    raw = json.loads(CACHE.read_text(encoding="utf-8"))
-    # ⚠️ 必须与 run() 走同一条过滤（2026-10-07 修）
-    #    原来这里直接用全部 K 线 ⇒ 含【未走完的当天】⇒ 前视。
-    #    实测影响：60% 档夏普 1.34111（正确）vs 1.31566（前视）
-    #    ⇒ 会让 selfcheck 对正确的 METHODS 表报"超容差"假警报。
-    raw, _cb_note = complete_bars(raw)
-    C = np.array([b["c"] for b in raw], float)
-    day = np.array([b["t"] // 86400000 for b in raw])
-    FR = np.array([fday.get(int(day[i]), 0.0) for i in range(len(C))])
-    P = panel(C, FR, FEE_PER_SIDE)
-    W = 60
-
-    # ① 对齐自检
-    print()
-    print("  ① 对齐口径")
-    a1 = sharpe(P.net(None)[W:])
-    b1 = sharpe(P.net_lookahead(None)[W:])
-    ratio = b1 / a1
-    ok = ratio > 1.35
-    print(f"     正确口径夏普 {a1:.3f}   前视口径夏普 {b1:.3f}   比值 {ratio:.2f}x")
-    print(f"     {'✅ 正确（前视必须明显更高）' if ok else '🔴 危险：两者接近，说明对齐写错了'}")
-
-    # ② METHODS 表核对
-    print()
-    print("  ② METHODS 表 vs 实算")
-    print(f"     {'版本':<18}{'表里夏普':>10}{'实算':>9}{'Δ':>8}"
-          f"{'表里回撤':>10}{'实算':>9}{'Δ':>8}")
-    print("     " + "-" * 66)
-    bad = 0
-    for (name, tv, need, t_sh, t_dd) in METHODS:
-        lev = LEVERAGE if tv is None else None
-        x = P.net(tv, lev=lev)[W:]
-        x = x[np.isfinite(x)]
-        r_sh, r_dd = sharpe(x), max_dd(x)
-        d_sh, d_dd = r_sh - t_sh, r_dd - t_dd
-        # ⚠️ 2026-10-06：容差从 ±0.005 收紧到 ±0.001。
-        #    原来 1.245 与真值 1.2442 差 0.0018，旧容差放过了它。
-        # ⚠️ 容差 ±0.003：METHODS 表是【快照】，而数据每天在长，
-        #    夏普会随之漂移（实测约 0.001/天）。
-        #    故意放到 ±0.003（约 3 天漂移）——
-        #    真出错时偏差会是 0.01+ 量级，不会被漏掉。
-        # 容差按快照年龄动态放大
-        try:
-            _asof = dt.datetime.strptime(METHODS_ASOF, "%Y-%m-%d").replace(
-                tzinfo=dt.UTC)
-            _age = max(0, (dt.datetime.now(dt.UTC) - _asof).days)
-        except Exception:
-            _age = 0
-        _tol_sh = min(0.02, max(0.003, 0.0012 * _age))
-        flag = "" if (abs(d_sh) < _tol_sh and abs(d_dd) < 0.005) else "  ⚠️"
-        if flag:
-            bad += 1
-        print(f"     {name:<18}{t_sh:>10.3f}{r_sh:>9.3f}{d_sh:>+8.3f}"
-              f"{t_dd*100:>9.1f}%{r_dd*100:>8.1f}%{d_dd*100:>+7.1f}pp{flag}")
-    print(f"     │ 容差：夏普 ±{_tol_sh:.4f}（快照 {METHODS_ASOF}，已 {_age} 天 × 0.0012/天），回撤 ±0.5pp")
-    print(f"     │ {'✅ 全部在容差内' if bad == 0 else f'⚠️ {bad} 处超容差 —— 跑 --sync-methods 更新 METHODS'}")
-
-    # ③ 门槛核对
-    print()
-    print("  ③ 门槛（20U ÷ 有仓位日第 10 分位仓位）")
-    for (name, tv, need, _, _) in METHODS:
-        w = P.weight(tv)[W:]
-        on = w[w > 0]
-        r_need = MIN_NOTIONAL / float(np.percentile(on, 10))
-        flag = "" if abs(r_need - need) < 0.15 else "  ⚠️"
-        print(f"     {name:<18} 表里 {need:>6.1f}U   实算 {r_need:>6.1f}U"
-              f"   Δ {r_need-need:>+5.1f}U{flag}")
-
-    # ④ DD_BY_LEV 核对
-    print()
-    print("  ④ DD_BY_LEV（固定版回撤随杠杆）")
-    print(f"     {'杠杆':>8}{'表里':>10}{'实算':>10}{'Δ':>9}{'夏普':>9}")
-    print("     " + "-" * 48)
-    for lev, t_dd in DD_BY_LEV:
-        x = P.net(None, lev=lev)[W:]
-        x = x[np.isfinite(x)]
-        r_dd = max_dd(x)
-        flag = "" if abs(r_dd - t_dd) < 0.03 else "  ⚠️"
-        print(f"     {lev:>8.3f}{t_dd*100:>9.1f}%{r_dd*100:>9.1f}%"
-              f"{(r_dd-t_dd)*100:>+8.1f}pp{sharpe(x):>9.3f}{flag}")
-
-    # ⑤ 整数杠杆 / 保证金模式
-    print()
-    print("  ⑤ 整数杠杆 / 保证金模式（币安只允许整数杠杆）")
-    print(f"     {'权益':>8}{'仓位':>9}{'设杠杆':>7}{'保证金':>9}"
-          f"{'整数':>6}{'够开':>6}{'逐仓强平':>11}{'全仓强平':>11}")
-    print("     " + "-" * 70)
-    lev_bad = []
-    for eq in (14.20, 14.8, 16, 18, 19.99, 20, 30, 31.7, 47.5, 100):
-        a = advice(eq, 2700.0, 0.445)
-        lp = a.get("lev_plan")
-        if lp is None:
-            continue
-        is_int = float(lp["lev"]).is_integer()
-        fits = lp["margin"] <= eq + 1e-9
-        if not is_int or not fits:
-            lev_bad.append(eq)
-        print(f"     {eq:>7.2f}U{a['position']:>9.4f}{lp['lev']:>6}x"
-              f"{lp['margin']:>8.2f}U{'✅' if is_int else '❌':>6}"
-              f"{'✅' if fits else '❌':>6}"
-              f"{lp['liq_iso_acc']*100:>10.1f}%{lp['liq_cross_acc']*100:>10.1f}%")
-    if lev_bad:
-        bad += 1
-        print(f"     ⚠️ 这些权益下杠杆非整数或开不出来：{lev_bad}")
-    else:
-        print("     ✅ 杠杆全是整数，且保证金 ≤ 权益")
-
-    # 杠杆必须 = ceil(仓位)
-    mis = []
-    for eq in (14.2, 15, 17, 19.5, 20, 25, 40):
-        a = advice(eq, 2700.0, 0.445)
-        exp = max(1, int(np.ceil(a["position"] - 1e-9)))
-        if a["lev_plan"]["lev"] != exp:
-            mis.append(eq)
-    if mis:
-        bad += 1
-        print(f"     ⚠️ 杠杆 ≠ ceil(仓位)：{mis}")
-    else:
-        print("     ✅ 杠杆 = ceil(仓位)")
-
-    # 低于门槛时不能报"可下单"（否则和"低于门槛开不出单"矛盾）
-    contra = [eq for eq in (0.5, 5, 10, 14.19)
-              if advice(eq, 2700.0, 0.445)["feasible"]]
-    if contra:
-        bad += 1
-        print(f"     ⚠️ 低于门槛却报可下单：{contra}")
-    else:
-        print("     ✅ 低于门槛时 feasible=False")
-
-    # 强平公式自洽：全仓强平时账户剩维持保证金
-    a = advice(14.8, 2700.0, 0.445)
-    lp = a["lev_plan"]
-    mm_keep = MMR * a["notional"]
-    resid = 14.8 - lp["liq_cross_px"] * a["notional"]
-    if abs(resid - mm_keep) > 0.005:
-        bad += 1
-        print(f"     ⚠️ 全仓强平残值 {resid:.4f} ≠ 维持保证金 {mm_keep:.4f}")
-    else:
-        print(f"     ✅ 全仓强平时账户剩维持保证金 {resid:.4f}")
-
-    print()
-    if bad == 0:
-        print("  ✅ 全部一致。")
-    else:
-        print(f"  ⚠️ 有 {bad} 处不一致 —— 上面带 ⚠️ 的行需要更新。")
-    print("=" * 88)
-    print()
+        raw,_=complete_bars(load_cache());validate_bars(raw,continuous=True);funding=load_funding()
+        if len(raw)<70:raise DataError("自检至少需要 70 根完成日线")
+        if any(r["t"]>=raw[60]["t"] and not r.get("markPrice") for r in funding):raise DataError("持有期资金费缺少结算标记价格，请联网更新")
+        if any(r.get("markPriceApproximate") for r in funding):print("⚠️ 部分早期标记价使用 API 8h 开盘近似，统计不等同账户实际扣费")
+        C=np.array([b["c"] for b in raw]);day_rates=funding_by_day();FR=np.array([day_rates.get(int(b["t"]//86400000),0) for b in raw])
+        P=panel(C,FR,FEE_PER_SIDE,bars=raw,funding=funding);W=60
+        for name,tv,need,expected_sh,expected_dd in METHODS:
+            x=P.net(tv,lev=LEVERAGE)[W:];w=P.weight(tv)[W:];on=w[w>0]
+            actual_need=MIN_NOTIONAL/MAX_POS if tv is None else MIN_NOTIONAL/float(np.percentile(on,10))
+            if abs(sharpe(x)-expected_sh)>.003 or abs(max_dd(x)-expected_dd)>.005:
+                errors.append(f"{name} 历史表超出容差")
+            if abs(actual_need-need)>.15:errors.append(f"{name} 统计分位门槛错误")
+            if np.any((w>0)&(~P.sig[W-1:-1].astype(bool))):errors.append(f"{name} 趋势空仓仍有目标")
+            if np.any((w>0)&(P.vol[W:]>VOL_CAP)):errors.append(f"{name} 波动上限未生效")
+        for lev,expected_dd in DD_BY_LEV:
+            if abs(max_dd(P.net(None,lev=lev)[W:])-expected_dd)>.005:errors.append(f"{lev}x 回撤表错误")
+        for tv in (.15,.25,.4,.6):
+            position,_=strategy_position(True,.05,90,tv)
+            plan=plan_order(90,2700,position,PositionState(),current_rules(),90)
+            if plan.actionable and plan.side=="BUY" and plan.required_funds>90+1e-9:
+                errors.append("取整后的保证金超预算")
+    except Exception as error:errors.append(f"{type(error).__name__}: {error}")
+    for error in errors:print(f"❌ {error}")
+    if not errors:print("✅ 全部一致：规则、数据、策略开关、数量预算和现金流统计")
+    else:print("自检失败；不会按成功状态退出。统计漂移请运行 --sync-methods。")
+    return not errors
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--console", action="store_true")
-    ap.add_argument("--check", action="store_true", help="读账户，算该下多少")
-    ap.add_argument("--archive", action="store_true", help="把今天的信号写进归档")
-    ap.add_argument("--history", action="store_true")
-    ap.add_argument("--backfill", action="store_true")
-    ap.add_argument("--selfcheck", action="store_true",
-                    help="核对 METHODS/DD_BY_LEV 表和实算是否一致 + 对齐自检")
-    ap.add_argument("--rebuild", action="store_true",
-                    help="从 API 全量重建日线缓存（缓存损坏时自动触发，也可手动跑）")
-    ap.add_argument("--sync-methods", action="store_true",
-                    help="把 METHODS 表更新为当前实算值（--selfcheck 报超容差时跑）")
-    ap.add_argument("--target-vol", type=float, default=None, metavar="N",
-                    help=f"目标波动率档位 5~60（默认 {DEFAULT_TARGET_VOL*100:g}）；"
-                         f"不填=锁 {DEFAULT_TARGET_VOL*100:g}%%（V2 不自动选档）。"
-                         f"想降风险用 25 或 15，但年化会大幅下降")
-    a = ap.parse_args()
-
-    if a.rebuild:
-        from binance_api import BN as _BN
-        load_cache(_BN(), rebuild=True)
-        return
-    if a.sync_methods:
-        sync_methods()
-        return
-    global TARGET_VOL_OVERRIDE, TARGET_VOL_EXPLICIT
-    # V2：默认锁定 60% 档（不给 --target-vol 时）
-    # 模块级默认已经是 DEFAULT_TARGET_VOL，这里保留是为了"显式声明"，
-    # 并保证 TARGET_VOL_EXPLICIT 为 False。
-    if a.target_vol is None:
-        TARGET_VOL_OVERRIDE = DEFAULT_TARGET_VOL
-        TARGET_VOL_EXPLICIT = False
-    if a.target_vol is not None:
-        v = a.target_vol / 100.0 if a.target_vol > 1 else a.target_vol
-        # ⚠️ 原来只在 METHODS 里精确匹配，等于人为限制成 15/25/40 三档。
-        #    实测 15%~60% 的夏普完全恒定（极差 0.0000），所以任何值都等价。
-        #    门槛按【最接近的档位】取（用于提示"权益够不够开单"）。
-        if not (0.05 <= v <= 0.60):
-            # ⚠️ 2026-10-07 审计修复：
-            #    ① 原来 `return` 让非法输入也返回 exit=0 ⇒ 脚本/任务计划察觉不到
-            #    ② 原来无论给 0 还是 61 都提示「超过 60%」—— 0 并没有超过
-            if v > 0.60:
-                why = "超过 60% 会触发 3x 上限截断，夏普反而下降"
+    # Windows redirected consoles may default to GBK, which cannot encode status symbols.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    ap=argparse.ArgumentParser(description="ETHUSDT MA50 手动交易辅助；只读交易所")
+    for flag in ("console","check","archive","history","backfill","selfcheck","rebuild","sync-methods"):
+        ap.add_argument("--"+flag,action="store_true")
+    ap.add_argument("--target-vol",type=float,default=None,help="目标波动率 5~60%%，默认 60")
+    ap.add_argument("--offline",action="store_true",help="仅用于 history/selfcheck/sync-methods，使用已验证缓存")
+    a=ap.parse_args()
+    global TARGET_VOL_OVERRIDE,TARGET_VOL_EXPLICIT
+    value=DEFAULT_TARGET_VOL if a.target_vol is None else (a.target_vol/100 if a.target_vol>1 else a.target_vol)
+    if not np.isfinite(value) or not .05<=value<=.60:ap.error("目标波动率必须在 5%~60%")
+    TARGET_VOL_OVERRIDE=value;TARGET_VOL_EXPLICIT=a.target_vol is not None
+    try:
+        if a.history:history();return 0
+        if a.offline and not (a.selfcheck or a.sync_methods):ap.error("offline 只用于历史/自检/统计同步")
+        if a.selfcheck or a.sync_methods:
+            if a.offline:load_exchange_rules()
             else:
-                why = "低于 5% 时仓位会被最小名义(20U)卡住，执行不到目标波动"
-            print(f"  🔴 目标波动率应在 5%~60% 之间（给的是 {a.target_vol}%）。{why}")
-            sys.exit(1)
-        TARGET_VOL_OVERRIDE = v
-        TARGET_VOL_EXPLICIT = True
-    if a.history:
-        history(); return
-    if a.backfill:
-        backfill(); return
-    if a.selfcheck:
-        selfcheck(); return
-
-    out, rec = run(a)
-    if rec is None:
-        print(out)
-        return
-
-    if a.archive:
-        do_archive(rec)
-
-    if a.console:
-        print(out)
-    outdir = ROOT / "data" / "reports"
-    outdir.mkdir(parents=True, exist_ok=True)
-    f = outdir / f"ma50_{dt.datetime.now():%Y%m%d_%H%M}.md"
-    f.write_text("```\n" + out + "```\n", encoding="utf-8")
-    print(f"\n  已生成：{f.relative_to(ROOT)}\n")
-    if a.archive:
-        print("  --archive 已写进归档；记得隔天跑一次 --backfill")
-    else:
-        print("  ⚠️ 这次【没有】写进归档。")
-        print("     想留下证据（前向检验要攒 120 天）：")
-        print("       python ma50_live.py --archive")
-        print("     或者用 Windows 任务计划每天自动跑（见 ma50_rules.md §6）")
+                from binance_api import BN
+                bn=BN();load_exchange_rules(bn);_,err=refresh_funding(bn)
+                if err:raise DataError(err)
+            if a.sync_methods:sync_methods();return 0
+            return 0 if selfcheck() else 1
+        if a.rebuild:
+            from binance_api import BN
+            bn=BN();load_cache(bn,rebuild=True);_,err=refresh_funding(bn,rebuild=True)
+            if err:raise DataError(err)
+            return 0
+        if a.backfill:backfill();return 0
+        out,rec=run(a)
+        if rec is None:print(out);return 1
+        if a.archive:do_archive(rec)
+        if a.console:print(out)
+        outdir=ROOT/"data/reports";outdir.mkdir(parents=True,exist_ok=True)
+        stamp=dt.datetime.now(dt.UTC).astimezone(dt.timezone(dt.timedelta(hours=8))).strftime("%Y%m%d_%H%M%S")
+        report=outdir/f"ma50_{stamp}.md";_atomic_write(report,"```\n"+out+"\n```\n")
+        print(f"已生成：{report}")
+        return 1 if rec.get("validation_status")=="blocked" else 0
+    except Exception as error:
+        print(f"⛔ 运行失败，未生成交易指令：{type(error).__name__}: {error}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,20 +1,13 @@
-# Python-generated files
+# Python and virtual environment
 __pycache__/
 *.py[oc]
+.venv/
+venv/
 build/
 dist/
-wheels/
-*.egg-info
+*.egg-info/
 
-# Virtual environments
-.venv
-venv/
-
-# Node（依赖可由 pnpm-lock.yaml 完整重建，不该进仓库）
-node_modules/
-.pnpm-store/
-
-# 密钥文件 —— 绝对不能提交
+# Credentials
 .env
 .env.*
 !.env.example
@@ -23,14 +16,7 @@ node_modules/
 *.p12
 credentials.json
 
-# 工具每次运行的输出（含账户余额），可随时重新生成
+# Generated reports and temporary writes
 data/reports/
-
-# 币安批量存档缓存（体积大，可重新下载）
-data/basis/
-
-# 一次性分析/审计脚本（非工具组成部分，多为临时验证用，含已知有 bug 的中间版本）
-paper/_analysis/
-
-# 从 API 拉的大体积 K 线（可随时重下：fetch_1h.py，约 12 次请求）
-data/crypto/ETHUSDT_1h.json
+*.tmp
+*.lock
