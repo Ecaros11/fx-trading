@@ -195,13 +195,49 @@ class BN:
                 pass
         return out
 
+    def income(self, symbol=None, limit=1000, **kw):
+        """
+        资金流水（转账、手续费、资金费、已实现盈亏）。
+
+        ⚠️ 2026-10-08 修复两处：
+          ① 原来默认 symbol="BTCUSDT" —— 但本项目交易的是 ETHUSDT，
+             忘记传 symbol 就会【静默】拿到 BTC 的数据（实测：
+             传 BTCUSDT 得 30 条 / 峰值 2.67，不传得 145 条 / 峰值 90.85）。
+             ⇒ 改为默认 None（= 返回【所有合约】的流水，最不容易搞错）。
+          ② 原来调 self.fapi(path, p) 没传 signed=True，而这个接口
+             【需要签名】（查自己的流水）⇒ 之前可能一直没正常工作。
+             ⇒ 现在显式 signed=True。
+        """
+        p = {"limit": limit}
+        if symbol:
+            p["symbol"] = symbol
+        p.update(kw)
+        return self.fapi("/fapi/v1/income", p, signed=True)
+
+    def all_income(self, max_pages=20, **kw):
+        """
+        分页拉取【全部】资金流水（不传 symbol ⇒ 覆盖所有合约）。
+
+        ⚠️ 为什么要分页：单次上限 1000 条，账户跑久了会超过。
+        ⚠️ 分页用 startTime 递增 —— 币安的 income 接口按时间升序返回，
+           所以用最后一条的时间 +1ms 作为下一页的起点。
+        """
+        rows, start = [], None
+        for _ in range(max_pages):
+            p = {"limit": 1000}
+            if start is not None:
+                p["startTime"] = start
+            p.update(kw)
+            r = self.fapi("/fapi/v1/income", p, signed=True)
+            if not r:
+                break
+            rows.extend(r)
+            if len(r) < 1000:
+                break
+            start = int(r[-1]["time"]) + 1
+        return rows
+
     def user_trades(self, symbol="BTCUSDT", limit=50, **kw):
         p = {"symbol": symbol, "limit": limit}
         p.update(kw)
         return self.fapi("/fapi/v1/userTrades", p)
-
-    def income(self, symbol="BTCUSDT", limit=100, **kw):
-        """资金流水（手续费、资金费、盈亏）"""
-        p = {"symbol": symbol, "limit": limit}
-        p.update(kw)
-        return self.fapi("/fapi/v1/income", p)

@@ -185,15 +185,36 @@ def main():
         if not snaps:
             print("  还没有记录。跑 `uv run dd_live.py --snapshot` 开始积累。")
             return
+        # ⚠️ 2026-10-08 修复：原来 pk 只从【本地快照】取累计最大值，
+        #    如果快照里权益一直创新高，回撤永远显示 0.00%（实测就是这样）。
+        #    现在与默认模式用同一套峰值：max(本地快照, API 流水重建)。
+        #    API 失败时退回快照（并标注）。
+        pk_snap = max(e for _, e, _, _, _ in snaps)
+        peaks = [pk_snap]
+        src = f"本地快照峰值 {pk_snap:,.2f} U"
+        try:
+            curve_h, _ = rebuild_curve(bn)
+            if curve_h:
+                pk_api = max(v for _, v in curve_h)
+                peaks.append(pk_api)
+                src += f" / API 流水峰值 {pk_api:,.2f} U"
+        except Exception as e:
+            src += f" / ⚠️ API 失败({type(e).__name__})，仅用快照"
+        PEAK = max(peaks)
+
         print("=" * 76)
         print("  权益记录")
         print("=" * 76)
+        print(f"  峰值取 {PEAK:,.2f} U   （{src}）")
+        print()
         print(f"  {'日期':<12}{'权益':>11}{'钱包':>11}{'浮亏':>11}{'回撤':>10}")
-        pk = 0.0
         for d, e, w, u, c in snaps:
-            pk = max(pk, e)
             print(f"  {d:<12}{e:>11.4f}{w:>11.4f}{u:>+11.4f}"
-                  f"{(e/pk-1)*100 if pk else 0:>9.2f}%")
+                  f"{(e/PEAK-1)*100:>9.2f}%")
+        print()
+        print(f"  ⇒ 最后一天 {(snaps[-1][1]/PEAK-1)*100:+.2f}%"
+              f"   （历史最坏 −54.3%，还有 "
+              f"{abs(-54.3-(snaps[-1][1]/PEAK-1)*100):.1f}pp）")
         return
 
     print("=" * 76)

@@ -192,12 +192,24 @@ ma[49:] = (cs[50:] - cs[:-50]) / 50
 onn = (C > ma)[60:].mean()
 chk(abs(onn - 0.55) < 0.02, f"在场比例 {onn*100:.1f}%（文档说 55.0%）")
 
-# 文档 §2.3 的例子
+# ⚠️ 2026-10-08：原来这里测的是【V1 的自动选档例子】
+#    （14.83U → 1.3486x → 4.61U），但：
+#      ① 文档 §2.3 已改成 V2 的内容，没有那个例子了
+#      ② V2 锁定 60% 档 ⇒ 14.83U 低于门槛 31.7U ⇒ 报 below_min
+#    现在改成测【V2 的实际行为】：低于门槛时报 below_min。
+_orig_tv = m.TARGET_VOL_OVERRIDE
+m.TARGET_VOL_OVERRIDE = m.DEFAULT_TARGET_VOL
 a = m.advice(14.83, 2707.0, 0.445)
-chk(abs(a["position"] - 1.3486) < 0.001, f"14.83U → 仓位 {a['position']:.4f}x")
-chk(abs(a["notional"] - 20.0) < 0.01, f"→ 名义 {a['notional']:.2f}U")
-chk(abs(a["drawdown"] + 0.689) < 0.005, f"→ 回撤 {a['drawdown']*100:.1f}%")
-chk(abs(a["worst"] - 4.61) < 0.02, f"→ 最坏 {a['worst']:.2f}U")
+chk(a["fail"] == "below_min" and not a["feasible"],
+    f"14.83U 低于门槛 → fail={a['fail']}（V2 锁 60% 档，门槛 "
+    f"{m.METHODS[1][2]:.1f}U）")
+# 再测一个【自动选档】的场景（显式把 override 设回 None）
+m.TARGET_VOL_OVERRIDE = None
+a2 = m.advice(14.83, 2707.0, 0.445)
+chk(abs(a2["position"] - 1.3486) < 0.001,
+    f"[自动选档] 14.83U → 仓位 {a2['position']:.4f}x")
+chk(abs(a2["notional"] - 20.0) < 0.01, f"[自动选档] → 名义 {a2['notional']:.2f}U")
+m.TARGET_VOL_OVERRIDE = _orig_tv
 
 # 文档 §4 表格标了 1.405x 口径 → 验证 1.405x 的回撤
 chk(abs(m.dd_for_lev(1.405) + 0.712) < 0.001,

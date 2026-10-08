@@ -80,7 +80,16 @@ MAX_SAFE_LEV = 3
 #    目标波动【最低】的 15% 档 ⇒ 赚到钱之后自动降杠杆。
 #    定投场景下尤其明显：权益一过最高门槛就永久锁在 15%。
 #    用 --target-vol 40 可以强制锁定某一档。
-TARGET_VOL_OVERRIDE = None
+# ⚠️ 2026-10-08 修复：这里原来是 None，而 main() 实际用 DEFAULT_TARGET_VOL。
+#    后果：任何【外部调用】（脚本/测试 import 后直接调 advice()）
+#          都会静默拿到"按权益自动选档"的结果，与工具实际运行不一致。
+#    实测（equity=76.87, vol=32%）：
+#        模块级 None  ⇒ 自动选中 25% 档 ⇒ 仓位 0.7812x
+#        工具实际 0.60 ⇒ 60% 档        ⇒ 仓位 1.8750x   （差 1.09x）
+#    ⇒ 现在模块级默认就与 main() 一致。
+TARGET_VOL_OVERRIDE = DEFAULT_TARGET_VOL
+# 是否由 --target-vol 显式指定（只影响文案，不影响计算）
+TARGET_VOL_EXPLICIT = False
 
 # ── 波动率目标版的「标称 vs 实际」口径 ──
 # 「目标波动率 25%」指的是【在场时】的目标（仓位 × 已实现波动 = 25%，恒等）。
@@ -96,8 +105,8 @@ VOL_ACHIEVE = 0.89
 
 # ── 样本量与不确定性（改数据时必须同步重算，文档 §5.1/§8 引用同一组数）──
 SE_SHARPE = 0.387            # 年化夏普的标准误 = sqrt((1+S_d^2/2)/n)·sqrt(365)
-SAMPLE_YEARS = 6.700          # 回测年数（第 60 根起算）
-SAMPLE_DAYS = 2446           # 回测天数
+SAMPLE_YEARS = 6.70          # 回测年数（第 60 根起算）
+SAMPLE_DAYS = 2447           # 回测天数
 FEE_PER_SIDE = 0.0005
 
 # ── 按本金匹配版本 ──
@@ -147,11 +156,11 @@ FEE_PER_SIDE = 0.0005
 #        ┌────────┬────────┬────────┬──────────┬──────────┬────────┬────────┐
 #        │  档位  │  门槛  │  夏普  │ 算数年化 │ 几何年化 │  回撤  │ 期末   │
 #        ├────────┼────────┼────────┼──────────┼──────────┼────────┼────────┤
-#        │  固定版   │  14.2U │ 1.0460 │   83.8%  │   67.4%  │ -71.2% │  31.6x │
-#        │  60%   │  31.7U │ 1.2875 │   79.6%  │   86.2%  │ -54.3% │  64.4x │
-#        │  40%   │  47.5U │ 1.2878 │   54.1%  │   58.2%  │ -39.4% │  21.6x │
-#        │  25%   │  76.1U │ 1.2895 │   33.9%  │   35.8%  │ -26.1% │   7.8x │
-#        │  15%   │ 126.8U │ 1.2895 │   20.3%  │   21.1%  │ -16.3% │   3.6x │
+#        │  固定版   │  14.2U │ 1.0332 │   82.8%  │   65.7%  │ -71.2% │  29.6x │
+#        │  60%   │  31.7U │ 1.2493 │   77.6%  │   82.1%  │ -54.3% │  55.6x │
+#        │  40%   │  47.5U │ 1.2389 │   52.3%  │   55.3%  │ -39.4% │  19.1x │
+#        │  25%   │  76.1U │ 1.2406 │   32.8%  │   34.2%  │ -26.1% │   7.2x │
+#        │  15%   │ 126.8U │ 1.2406 │   19.7%  │   20.2%  │ -16.3% │   3.4x │
 #        └────────┴────────┴────────┴──────────┴──────────┴────────┴────────┘
 #    同期 ETH 买入持有：算数 74.9%  几何 51.0%
 #
@@ -164,14 +173,14 @@ FEE_PER_SIDE = 0.0005
 #   数据每天长 1 根 ⇒ 夏普约漂移 0.0012/天
 #   ⇒ 容差 = max(0.003, 0.0012 × 天数)，上限 0.02
 # 超出容差时跑 `--sync-methods` 一键更新。
-METHODS_ASOF = "2026-10-07"
+METHODS_ASOF = "2026-10-08"
 
 METHODS = [
-    ("固定版",             None,      14.2,     1.0460, -0.712),
-    ("波动率目标 60%",       0.6,       31.7,     1.2875, -0.543),
-    ("波动率目标 40%",       0.4,       47.5,     1.2878, -0.394),
-    ("波动率目标 25%",       0.25,      76.1,     1.2895, -0.261),
-    ("波动率目标 15%",       0.15,      126.8,    1.2895, -0.163),
+    ("固定版",             None,      14.2,     1.0332, -0.712),
+    ("波动率目标 60%",       0.6,       31.7,     1.2493, -0.543),
+    ("波动率目标 40%",       0.4,       47.5,     1.2389, -0.394),
+    ("波动率目标 25%",       0.25,      76.1,     1.2406, -0.261),
+    ("波动率目标 15%",       0.15,      126.8,    1.2406, -0.163),
 ]
 
 # ── 固定版的回撤随杠杆变（同一策略，只缩放仓位，夏普不变但回撤变）──
@@ -1094,7 +1103,7 @@ def run(a):
             if rvol is not None and np.isfinite(rvol):
                 A(f"  {VOL_WINDOW} 日已实现波动   {rvol*100:.1f}%  （波动率目标版要用）")
                 A("")
-            _tag = "（--target-vol 强制）" if TARGET_VOL_OVERRIDE is not None else ""
+            _tag = "（--target-vol 强制）" if TARGET_VOL_EXPLICIT else ""
             A(f"  账户权益 {eq:,.2f} USDT  ⇒  匹配版本：**{adv['method']}**{_tag}")
             if TARGET_VOL_OVERRIDE is not None and eq < adv["threshold"]:
                 A(f"     ⚠️ 但权益 {eq:,.2f}U < 该档门槛 {adv['threshold']:.1f}U"
@@ -1540,6 +1549,19 @@ def sync_methods():
     except StopIteration:
         pass          # 找不到表就跳过，不阻断 METHODS 的更新
 
+
+    # ⚠️ 2026-10-08 修复：一并更新【所有派生常量】——
+    #    原来只改 METHODS，导致 SAMPLE_DAYS 停留在旧值（实测 2446 vs 实算 2447）。
+    _nd = len(raw) - W
+    _Sd = rows[1][3] / np.sqrt(365)          # 60% 档日夏普
+    _se = float(np.sqrt((1 + _Sd ** 2 / 2) / _nd) * np.sqrt(365))
+    src = _re.sub(r"SAMPLE_DAYS = \d+", f"SAMPLE_DAYS = {_nd}", src, count=1)
+    src = _re.sub(r"SAMPLE_YEARS = [\d.]+", f"SAMPLE_YEARS = {_nd / 365:.2f}",
+                  src, count=1)
+    src = _re.sub(r"SE_SHARPE = [\d.]+", f"SE_SHARPE = {_se:.3f}", src, count=1)
+    print(f"  ✅ 派生常量已更新：SAMPLE_DAYS={_nd}  "
+          f"SAMPLE_YEARS={_nd/365:.2f}  SE_SHARPE={_se:.3f}")
+
     src = _re.sub(r"METHODS = \[.*?\n\]", "\n".join(lines), src, count=1,
                   flags=_re.S)
     today = dt.datetime.now(dt.UTC).strftime("%Y-%m-%d")
@@ -1754,10 +1776,13 @@ def main():
     if a.sync_methods:
         sync_methods()
         return
-    global TARGET_VOL_OVERRIDE
+    global TARGET_VOL_OVERRIDE, TARGET_VOL_EXPLICIT
     # V2：默认锁定 60% 档（不给 --target-vol 时）
+    # 模块级默认已经是 DEFAULT_TARGET_VOL，这里保留是为了"显式声明"，
+    # 并保证 TARGET_VOL_EXPLICIT 为 False。
     if a.target_vol is None:
         TARGET_VOL_OVERRIDE = DEFAULT_TARGET_VOL
+        TARGET_VOL_EXPLICIT = False
     if a.target_vol is not None:
         v = a.target_vol / 100.0 if a.target_vol > 1 else a.target_vol
         # ⚠️ 原来只在 METHODS 里精确匹配，等于人为限制成 15/25/40 三档。
@@ -1774,6 +1799,7 @@ def main():
             print(f"  🔴 目标波动率应在 5%~60% 之间（给的是 {a.target_vol}%）。{why}")
             sys.exit(1)
         TARGET_VOL_OVERRIDE = v
+        TARGET_VOL_EXPLICIT = True
     if a.history:
         history(); return
     if a.backfill:
