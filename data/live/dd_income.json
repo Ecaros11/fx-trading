@@ -1459,16 +1459,26 @@
       "info": "FUNDING_FEE",
       "tranId": "1604867429878129401",
       "tradeId": ""
+    },
+    {
+      "symbol": "ETHUSDT",
+      "incomeType": "FUNDING_FEE",
+      "income": "-0.00358378",
+      "asset": "USDT",
+      "time": 1791475200000,
+      "info": "FUNDING_FEE",
+      "tranId": "1606075382803133411",
+      "tradeId": ""
     }
   ],
   "ranges": [
     [
       1783779005560,
-      1791469170834
+      1791475930269
     ]
   ],
-  "start": 1783779570834,
-  "end": 1791469170834,
+  "start": 1783786330269,
+  "end": 1791475930269,
   "complete": true,
   "account_scope": "2bf47f4761d2b477852024c2",
   "schema_version": 1
