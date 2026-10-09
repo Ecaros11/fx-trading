@@ -142,6 +142,9 @@ class PositionState:
     leverage: int = MAX_LEVERAGE
     margin_type: str = "isolated"
     liquidation_price: float = 0.0
+    mark_price: float | None = None
+    isolated_wallet: float | None = None
+    isolated_margin: float | None = None
 
 
 def parse_positions(rows, hedge):
@@ -177,8 +180,18 @@ def parse_positions(rows, hedge):
     mode = long_row.get("marginType")
     if mode not in ("isolated", "cross"):
         raise ValueError("保证金模式未知")
+    mark = None if long_row.get("markPrice") in (None,"") else finite(long_row["markPrice"],"持仓标记价",0)
+    if mark is not None and mark <= 0:
+        raise ValueError("持仓标记价必须为正")
+    wallet = None if long_row.get("isolatedWallet") in (None,"") else finite(long_row["isolatedWallet"],"逐仓钱包")
+    margin = None if long_row.get("isolatedMargin") in (None,"") else finite(long_row["isolatedMargin"],"逐仓权益")
+    if mode == "isolated" and wallet is not None and margin is not None and long_row.get("unRealizedProfit") not in (None,""):
+        pnl = finite(long_row["unRealizedProfit"],"持仓浮盈")
+        if abs(margin-wallet-pnl) > max(.0001,abs(margin)*1e-6):
+            raise ValueError("逐仓权益与钱包及浮盈不一致")
     return PositionState(long_qty, short_qty, bool(hedge), int(leverage), mode,
-                         finite(long_row.get("liquidationPrice") or 0, "强平价", 0))
+                         finite(long_row.get("liquidationPrice") or 0, "强平价", 0),
+                         mark, wallet, margin)
 
 
 @dataclass(frozen=True)

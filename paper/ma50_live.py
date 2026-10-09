@@ -204,7 +204,8 @@ FIELDS = [
 ]
 
 FIELDS += ["rebalance_policy","soft_rebalance_pct","trend_signal","decision_reason","side","position_side","reduce_only","order_qty","target_qty","validation_status","price_return_1d","price_return_7d","price_return_10d","price_return_30d","price_drawdown_10d"]
-FIELDS += ["decision_id","decision_ms","decision_at","account_scope","reference_price","reference_price_ms","rule_version"]
+FIELDS += ["held_qty_at_signal","available_at_signal","daily_check_status","daily_prior_runs","daily_fill_count","daily_ledger_cutoff_ms"]
+FIELDS += ["decision_id","decision_ms","decision_at","account_scope","reference_price","reference_price_ms","rule_version","mark_price_at_position","liquidation_price_at_position","liquidation_distance_pct","isolated_wallet_at_position","isolated_margin_at_position"]
 
 
 def _atomic_write(path, text, encoding="utf-8"):
@@ -481,6 +482,18 @@ def decide_action(sig_long, prev_long, tgt_pos, rows, do_order=None, today=None,
     return "未查持仓"
 
 
+
+# Bound the whole price/account sampling interval, not the position updateTime
+# (which can legitimately stay old when an unchanged position is queried).
+MAX_SNAPSHOT_AGE_MS = 120_000
+
+def validate_decision_freshness(bar_ms, reference_ms, decision_ms):
+    if not 0 <= decision_ms-reference_ms <= MAX_SNAPSHOT_AGE_MS:
+        raise DataError("行情与账户查询跨度超过120秒或时钟倒退，请重新运行")
+    if bar_ms != (decision_ms//86400000-1)*86400000:
+        raise DataError("查询已跨越UTC日线边界，信号不是最近完成日线，请重新运行")
+
+
 def run(a):
     from binance_api import BN
     bn = BN()
@@ -609,11 +622,12 @@ def run(a):
     A("")
 
     # ── 执行建议：唯一 OrderPlan 同时供显示和归档使用 ──
-    eq = None; held = None; state = None; tgt_pos = 0.0
+    eq = None; held = None; state = None; tgt_pos = 0.0; available = None
     rvol = sig["rvol"]
     adv = {"method":"","target_vol":TARGET_VOL_OVERRIDE,"position":0.0,"notional":0.0,"qty":0.0,"reason":sig["reason"]}
     plan = OrderPlan("hold","未读取账户")
     account_checked = False
+    decision_ms = None
     if a.check or a.archive:
         plan = OrderPlan("blocked","账户或持仓尚未验证")
         try:
@@ -637,6 +651,8 @@ def run(a):
             tgt_pos = adv["position"]
             if adv.get("fail")=="bad_input": raise DataError("仓位输入无效")
             pending = validate_pending_orders(bn)
+            decision_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
+            validate_decision_freshness(sig["bar_t"],reference_price_ms,decision_ms)
             plan = plan_order(eq,price,tgt_pos,state,current_rules(),available,fee)
             account_checked = True
             A("  账户与调仓")
@@ -654,8 +670,15 @@ def run(a):
             elif plan.status=="blocked": A(f"  ⛔ 暂停建议：{plan.reason}")
             else: A(f"  ⇒ 【不用动】（{plan.reason}）")
             A(f"  策略增仓要求：逐仓、3x；当前 {state.margin_type}、{state.leverage}x")
+            if state.margin_type=="isolated" and state.isolated_wallet is not None:
+                A(f"  实际逐仓钱包 {state.isolated_wallet:.4f} USDT"+
+                  (f"；逐仓权益 {state.isolated_margin:.4f} USDT" if state.isolated_margin is not None else ""))
             if state.liquidation_price>0:
-                A(f"  当前 API 强平价 {state.liquidation_price:,.2f}；相对当前价 {(state.liquidation_price/price-1)*100:+.1f}%")
+                if state.mark_price is None:
+                    A(f"  当前 API 强平价 {state.liquidation_price:,.2f}；持仓标记价缺失，强平距离未知")
+                else:
+                    A(f"  持仓标记价 {state.mark_price:,.2f}；当前 API 强平价 {state.liquidation_price:,.2f}；相对标记价 {(state.liquidation_price/state.mark_price-1)*100:+.1f}%")
+            A("  账户、持仓和价格来自多次只读请求，不是原子快照")
             A("  波动率上限不能保证避免突发暴跌或未来强平；低波动下任何档位均可能接近 3x")
         except Exception as error:
             plan = OrderPlan("blocked",f"账户依赖失败：{type(error).__name__}: {error}")
@@ -667,10 +690,14 @@ def run(a):
     A(f"  普通加减仓门限均为权益 {strategy.SOFT_REBALANCE:.0%}；新开仓、目标归零或持仓名义超过3倍权益时不受软门限限制")
     A("  减仓不使用增仓的最小名义门限；双向持仓模式必须明确 LONG")
     if st.get("fund_err"): A(f"  ⚠️ 资金费刷新失败，成本数据未验证：{st['fund_err']}")
+    A("  数量建议仅对应本次采样；价格或持仓变化后重新运行，执行前核对订单")
     A("  历史统计使用日线开盘价近似成交与逐次资金费；不构成真实成交或零强平验证")
     A("")
 
-    decision_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
+    if decision_ms is None:
+        decision_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
+    if not (a.check or a.archive):
+        validate_decision_freshness(sig["bar_t"],reference_price_ms,decision_ms)
     rule_config = dict(ma=MA_WINDOW,vol=VOL_WINDOW,target_vol=adv.get("target_vol"),
                        vol_cap=strategy.VOL_CAP,leverage=strategy.MAX_LEVERAGE,
                        rebalance_pct=strategy.SOFT_REBALANCE,rules=asdict(current_rules()))
@@ -692,10 +719,17 @@ def run(a):
         "rebalance_policy":"symmetric","soft_rebalance_pct":f"{strategy.SOFT_REBALANCE:.4f}",
         "advice_qty":f"{format_qty(plan.target_qty)}" if account_checked else "",
         "advice_notional":f"{plan.target_qty*price:.2f}" if account_checked else "",
+        "held_qty_at_signal":str(held) if account_checked else "",
+        "available_at_signal":str(available) if account_checked else "",
         "equity_at_signal":f"{eq:.4f}" if account_checked else "","method":adv.get("method","") if account_checked else "",
         "target_vol":f"{adv['target_vol']:.2f}" if account_checked and adv.get("target_vol") is not None else "",
         "target_position":f"{tgt_pos:.4f}" if account_checked else "","lev_setting":str(state.leverage) if account_checked else "",
         "margin_mode":state.margin_type if account_checked else "","liq_acc_pct":"",
+        "mark_price_at_position":str(state.mark_price) if account_checked and state.mark_price is not None else "",
+        "liquidation_price_at_position":str(state.liquidation_price) if account_checked else "",
+        "liquidation_distance_pct":f"{(1-state.liquidation_price/state.mark_price)*100:.6f}" if account_checked and state.mark_price and state.liquidation_price>0 else "",
+        "isolated_wallet_at_position":str(state.isolated_wallet) if account_checked and state.isolated_wallet is not None else "",
+        "isolated_margin_at_position":str(state.isolated_margin) if account_checked and state.isolated_margin is not None else "",
         "realized_vol_pct":f"{rvol*100:.2f}","funding_pct_today":f"{f_sig*100:.5f}" if f_sig is not None else "",
         "funding_pct_next":f"{f_next*100:.5f}" if f_next is not None else "","entry_ref":f"{sig['close']:.2f}",
         "fwd_1d":"","fwd_7d":"","fwd_10d":"","fwd_30d":"","max_dd_10d":"","checked_at":"","status":"", "notes":plan.reason,
@@ -882,14 +916,20 @@ def main():
     ap=argparse.ArgumentParser(description="ETHUSDT MA50 手动交易辅助；只读交易所")
     for flag in ("console","check","archive","history","backfill","selfcheck","rebuild","sync-methods"):
         ap.add_argument("--"+flag,action="store_true")
+    ap.add_argument("--daily",action="store_true",help="统一日检：DD采样及成交同步、MA50检查归档、同日核对与操作摘要")
     ap.add_argument("--target-vol",type=float,default=None,help="目标波动率 5~60%%，默认 60")
     ap.add_argument("--offline",action="store_true",help="仅用于 history/selfcheck/sync-methods，使用已验证缓存")
     a=ap.parse_args()
+    if a.daily and any((a.history,a.backfill,a.selfcheck,a.rebuild,a.sync_methods,a.offline)):
+        ap.error("--daily不能与历史、回填、自检、重建、统计同步或离线模式合用")
     global TARGET_VOL_OVERRIDE,TARGET_VOL_EXPLICIT
     value=DEFAULT_TARGET_VOL if a.target_vol is None else (a.target_vol/100 if a.target_vol>1 else a.target_vol)
     if not np.isfinite(value) or not .05<=value<=.60:ap.error("目标波动率必须在 5%~60%")
     TARGET_VOL_OVERRIDE=value;TARGET_VOL_EXPLICIT=a.target_vol is not None
     try:
+        if a.daily:
+            from daily_check import run_daily
+            return run_daily(a, sys.modules[__name__])
         if a.history:history();return 0
         if a.offline and not (a.selfcheck or a.sync_methods):ap.error("offline 只用于历史/自检/统计同步")
         if a.selfcheck or a.sync_methods:

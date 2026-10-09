@@ -148,7 +148,7 @@ def normalize_snapshot(acct, positions, start, end):
         if row['leverage']<1:
             raise DataError('持仓杠杆无效')
         auto=p.get('isAutoAddMargin')
-        if auto not in (True,False,'true','false'):
+        if not (type(auto) is bool or type(auto) is str and auto in ('true','false')):
             raise DataError('自动追加保证金状态未知')
         row['isAutoAddMargin']=auto is True or auto=='true'
         row['updateTime']=integer(p['updateTime'],'持仓更新时间')
@@ -211,17 +211,39 @@ def load_ledger(path, scope=None):
         return None
     return validate(json.loads(path.read_text(encoding='utf-8-sig')),scope)
 
+def trade_query_ranges(old, floor, end):
+    if not old or not old['trade_ranges']:
+        return [[floor,end]]
+    known=ranges(old['trade_ranges'])
+    last=max(b for a,b in known)
+    if last>end:
+        raise DataError('账本已查询时刻晚于本次服务器截止')
+    first=max(floor,known[0][0]);cursor=first;missing=[]
+    for a,b in known:
+        if b<cursor:
+            continue
+        if a>cursor:
+            missing.append([cursor,min(a-1,end)])
+        cursor=max(cursor,b+1)
+        if cursor>end:
+            break
+    if cursor<=end:
+        missing.append([cursor,end])
+    return ranges(missing+[[max(floor,last-OVERLAP),end]])
+
 def sync_ledger(path,bn,scope,income_book,snapshot,decisions_path=None):
     """All fetching/validation completes before the canonical ledger's atomic commit."""
     if not scope or income_book.get('complete') is not True or income_book.get('account_scope',scope)!=scope:
         raise DataError('账户归属或流水完整性不可验证')
     end=timestamp(income_book['end']);floor=max(0,end-RETENTION)
     old=load_ledger(path,scope)
-    last=max((b for a,b in old['trade_ranges']),default=floor) if old else floor
-    if last>end:
-        raise DataError('账本已查询时刻晚于本次服务器截止')
-    start=max(floor,last-OVERLAP) if old else floor
-    fresh=fetch_trades(bn,start,end)
+    queries=trade_query_ranges(old,floor,end)
+    fresh={'rows':[],'ranges':queries,'calls':0,'complete':True}
+    for a,b in queries:
+        part=fetch_trades(bn,a,b,max_calls=1000-fresh['calls'])
+        fresh['rows'].extend(part['rows']);fresh['calls']+=part['calls']
+    fresh['rows']=normalize_trades(fresh['rows'])
+    start=queries[0][0]
     income=normalize_income(income_book['rows'])
     iranges=ranges(income_book['ranges'])
     if any(not any(a<=r['time']<=b for a,b in iranges) for r in income):
@@ -238,7 +260,7 @@ def sync_ledger(path,bn,scope,income_book,snapshot,decisions_path=None):
         current['snapshots'].append(snapshot)
         current['snapshots'].sort(key=lambda x:(x['observed_end_ms'],x['id']))
         current['runs'].append({'id':uuid.uuid4().hex,'cutoff_ms':end,
-           'trade_query_start':start,'trade_query_end':end,'trade_calls':fresh['calls'],
+           'trade_query_start':start,'trade_query_end':end,'trade_queries':queries,'trade_calls':fresh['calls'],
            'new_trades':len(current['trades'])-old_count,
            'snapshot_id':snapshot['id']})
         validate(current,scope)
@@ -362,9 +384,37 @@ def summary(book):
             dif={a:amount(D(f.get(a,'0'))+D(c.get(a,'0')),'手续费对账差额') for a in sorted(set(f)|set(c))}
             pnl=sum((D(x['income']) for x in ir if x['incomeType']=='REALIZED_PNL' and x['asset']=='USDT'),D(0))
             fillpnl=sum((D(x['realizedPnl']) for x in ft),D(0))
+            # Totals can cancel swapped/missing transactions: reconcile linked trade IDs too.
+            expected={};actual={};unlinked=0;missing_ids=set()
+            known={str(t['id']) for t in ft}
+            for t in ft:
+                expected[('COMMISSION',str(t['id']),t['commissionAsset'])]=Decimal(t['commission'])
+                expected[('REALIZED_PNL',str(t['id']),'USDT')]=Decimal(t['realizedPnl'])
+            for row in ir:
+                if row['incomeType'] not in ('COMMISSION','REALIZED_PNL'):
+                    continue
+                tid=row.get('tradeId')
+                if tid in (None,''):
+                    unlinked+=1;continue
+                tid=str(integer(tid,'流水成交ID'))
+                if tid not in known:
+                    missing_ids.add(tid)
+                key=(row['incomeType'],tid,row['asset'])
+                actual[key]=actual.get(key,D(0))+D(row['income'])
+            detail=[]
+            # With absent IDs only aggregate reconciliation is available.
+            if not unlinked:
+                for key in sorted(set(expected)|set(actual)):
+                    exp=expected.get(key,D(0));obs=actual.get(key,D(0))
+                    delta=exp+obs if key[0]=='COMMISSION' else exp-obs
+                    if abs(delta)>D('.00001'):
+                        detail.append({'income_type':key[0],'trade_id':key[1],'asset':key[2],'difference':amount(delta,'逐笔差额')})
             reconciliation.append({'start':lo,'end':hi,'commission_difference_by_asset':dif,
-                                    'realized_pnl_difference_usdt':amount(fillpnl-pnl,'盈亏对账差额')})
-    return {'fills':len(trades),'orders':len({t['orderId'] for t in trades}),'commission_by_asset':fees,'funding_income_by_asset':funding,
+                                    'realized_pnl_difference_usdt':amount(fillpnl-pnl,'盈亏对账差额'),
+                                    'per_trade_differences':detail,
+                                    'unlinked_income_count':unlinked,'income_trade_ids_missing_from_fills':sorted(missing_ids)})
+    reconciled=bool(joint) and all(all(abs(D(v))<=D('.00001') for v in c['commission_difference_by_asset'].values()) and abs(D(c['realized_pnl_difference_usdt']))<=D('.00001') and not c['per_trade_differences'] and not c['income_trade_ids_missing_from_fills'] for c in reconciliation)
+    return {'reconciled':reconciled,'fills':len(trades),'orders':len({t['orderId'] for t in trades}),'commission_by_asset':fees,'funding_income_by_asset':funding,
             'fill_realized_pnl_usdt':amount(realized,'已实现盈亏'),
             'net_realized_usdt':amount(netrealized-trade_fee+funding_usdt,'已实现净额') if joint else None,
             'net_ranges':joint,'net_components':{'realized':amount(netrealized,'盈亏'),'commission_usdt':amount(trade_fee,'费用'),'funding_income_usdt':amount(funding_usdt,'资金费')},
@@ -379,13 +429,17 @@ def print_summary(book):
     print(f"  已实现盈亏 {x['fill_realized_pnl_usdt']} USDT")
     print('  实际手续费（正数为扣费）：'+json.dumps(x['commission_by_asset'],ensure_ascii=False))
     print('  资金费收入（负数为支付）：'+json.dumps(x['funding_income_by_asset'],ensure_ascii=False))
-    print(f"  共同覆盖区间已实现净额 {x['net_realized_usdt']} USDT" if x['net_ranges'] else '  无共同查询覆盖，净额无法计算')
+    label='共同覆盖区间已实现净额' if x['reconciled'] else '未通过对账的暂算净额'
+    print(f"  {label} {x['net_realized_usdt']} USDT" if x['net_ranges'] else '  无共同查询覆盖，净额无法计算')
     print('  净额组成：'+json.dumps(x['net_components'],ensure_ascii=False))
     for c in x['reconciliation']:
-        ok=all(abs(Decimal(v))<=Decimal('.00001') for v in c['commission_difference_by_asset'].values()) and abs(Decimal(c['realized_pnl_difference_usdt']))<=Decimal('.00001')
+        ok=all(abs(Decimal(v))<=Decimal('.00001') for v in c['commission_difference_by_asset'].values()) and abs(Decimal(c['realized_pnl_difference_usdt']))<=Decimal('.00001') and not c['per_trade_differences'] and not c['income_trade_ids_missing_from_fills']
         print(f"  流水对账 {iso(c['start'])}～{iso(c['end'])}："+('一致' if ok else '存在差额，请核查')+
               '；手续费差额 '+json.dumps(c['commission_difference_by_asset'],ensure_ascii=False)+
               '；已实现盈亏差额 '+c['realized_pnl_difference_usdt']+' USDT')
+        print(f"  逐笔差额 {len(c['per_trade_differences'])}项；未找到对应成交的流水ID {len(c['income_trade_ids_missing_from_fills'])}个")
+        if c['unlinked_income_count']:
+            print(f"  {c['unlinked_income_count']}条流水缺少成交ID，只核对合计，不能证明逐笔归属一致。")
     if len(x['trade_ranges'])>1 or len(x['income_ranges'])>1:
         print('  查询覆盖存在断档，未把缺口当作零交易或零费用。')
     for label,rs in (('成交',book['trade_ranges']),('流水',book['income_ranges'])):
@@ -396,4 +450,5 @@ def print_summary(book):
         print('  另有ETHUSDT其他类型流水：'+json.dumps(x['other_eth_income_by_asset'],ensure_ascii=False)+'；未混入上述净额。')
     print('  '+x['net_note'])
     print('  查询覆盖为API已完整请求区间，不证明是全部账户历史；快照不是原子快照。')
+    return x['reconciled']
 

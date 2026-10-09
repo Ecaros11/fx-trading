@@ -186,7 +186,7 @@ class CLITests(unittest.TestCase):
         self.stack.enter_context(patch.object(d,'EXECUTION_LOG',self.root/'execution.json'));self.stack.enter_context(patch.object(d,'DECISION_LOG',self.root/'decisions.json'))
         self.account={'multiAssetsMargin':False,'totalMarginBalance':'90','totalWalletBalance':'100','totalUnrealizedProfit':'-10','availableBalance':'50'}
     def tearDown(self):self.stack.close();self.tmp.cleanup()
-    def run_cli(self,args=(),account=None,rows=None,fail=None):
+    def run_cli(self,args=(),account=None,rows=None,fail=None,result=None,explicit=False):
         acct=self.account if account is None else account
         class BN:
             key='test-key'
@@ -205,8 +205,20 @@ class CLITests(unittest.TestCase):
         out=io.StringIO()
         # Deterministic retry without sleeps or network.
         original=d.api_retry
-        with patch.object(d,'bn_api',return_value=BN()),patch.object(d,'api_retry',lambda fn,**k:original(fn,base=0)),patch.object(sys,'argv',['dd_live.py']+list(args)),contextlib.redirect_stdout(out):code=d.main()
+        with patch.object(d,'bn_api',return_value=BN()),patch.object(d,'api_retry',lambda fn,**k:original(fn,base=0)),patch.object(sys,'argv',['dd_live.py']+list(args)),contextlib.redirect_stdout(out):code=d.main(list(args) if explicit else None,result=result)
         return code,out.getvalue()
+    def test_explicit_snapshot_args_return_fresh_structured_ledger(self):
+        result={}
+        code,_=self.run_cli(['--snapshot'],result=result,explicit=True)
+        self.assertEqual(code,0)
+        self.assertEqual(result['equity'],90)
+        self.assertEqual(result['ledger']['account_scope'],result['account_scope'])
+        self.assertEqual(result['ledger']['trade_ranges'][-1][1],NOW)
+        self.assertTrue(d.EQ_LOG.exists())
+    def test_failed_snapshot_returns_no_successful_ledger(self):
+        result={}
+        code,_=self.run_cli(['--snapshot'],fail='income',result=result,explicit=True)
+        self.assertEqual(code,1);self.assertNotIn('ledger',result)
     def test_default_labels_unknown_capital_and_separate_metrics(self):
         code,out=self.run_cli();self.assertEqual(code,0);self.assertIn('无法核实',out);self.assertIn('不是已证明的累计本金',out);self.assertIn('钱包回撤',out)
     def test_snapshot_failure_does_not_create_bogus_record(self):
@@ -233,5 +245,32 @@ class CLITests(unittest.TestCase):
     def test_timestamp_safety_survives_resync(self):
         import binance_api
         with patch.object(binance_api.BN,'__init__',return_value=None),patch.object(binance_api.BN,'_ts',return_value=10000):self.assertEqual(d.bn_api()._ts(),5000)
+
+
+class CohortAuditTests(unittest.TestCase):
+    def test_unknown_old_peak_excluded_from_verified_cohort(self):
+        rows=[snap(NOW-2*s.DAY,200,schema_version='',account_scope=''),
+              snap(NOW-s.DAY,100,schema_version='2',account_scope='scope'),
+              snap(NOW,90,schema_version='2',account_scope='scope')]
+        verified=d.verified_samples(rows,'scope')
+        peak,dd,_=s.observed_drawdowns(verified)
+        self.assertEqual(peak,100);self.assertEqual(len(dd),2);self.assertAlmostEqual(dd[-1],-.1)
+    def test_scope_and_schema_both_required(self):
+        rows=[snap(NOW,100,schema_version='2',account_scope='other'),
+              snap(NOW+1,100,schema_version='2',account_scope=''),
+              snap(NOW+2,100,schema_version='',account_scope='scope')]
+        self.assertEqual(d.verified_samples(rows,'scope'),[])
+    def test_offline_history_keeps_legacy_but_no_legacy_nav_or_peak(self):
+        rows=[snap(NOW-2*s.DAY,200,schema_version='',account_scope=''),
+              snap(NOW-s.DAY,100,schema_version='2',account_scope='scope'),
+              snap(NOW,90,schema_version='2',account_scope='scope')]
+        out=io.StringIO()
+        with contextlib.redirect_stdout(out):d.history_report(rows,book(start=NOW-3*s.DAY)|{'account_scope':'scope'})
+        self.assertIn('-10.00%',out.getvalue())
+        self.assertNotIn('-55.00%',out.getvalue())
+        self.assertIn('旧版/归属未核验',out.getvalue())
+    def test_other_account_flow_cache_not_used_for_history(self):
+        rows=[snap(NOW,100,schema_version='2',account_scope='scope')]
+        with self.assertRaises(s.DataError):d.history_report(rows,book()|{'account_scope':'other'})
 
 if __name__=='__main__':unittest.main()

@@ -38,22 +38,32 @@ def realized_vol(r, i, win=VOL_WINDOW):
     return float(values.std(ddof=1) * np.sqrt(PY)) if i >= win + 1 else np.nan
 
 
-def sharpe(x, ann=PY):
+
+def _returns(x):
     x = np.asarray(x, float)
-    if not len(x) or not np.isfinite(x).all():
-        raise ValueError("收益序列缺失或有非有限值")
-    return float(x.mean() / x.std() * np.sqrt(ann)) if x.std() else 0.0
+    if x.ndim != 1 or not len(x) or not np.isfinite(x).all() or np.any(x < -1):
+        raise ValueError("收益必须是一维非空有限序列，且单期不能低于-100%")
+    return x
+
+
+def sharpe(x, ann=PY):
+    x = _returns(x)
+    if not np.isfinite(ann) or ann <= 0:
+        raise ValueError("年化周期必须为正且有限")
+    sd = x.std(ddof=1) if len(x) > 1 else 0.0
+    return float(x.mean() / sd * np.sqrt(ann)) if sd else 0.0
 
 
 def max_dd(x):
-    eq = np.r_[1.0, np.cumprod(1 + np.asarray(x, float))]
+    x = _returns(x)
+    eq = np.r_[1.0, np.cumprod(1 + x)]
     return float(np.min(eq / np.maximum.accumulate(eq) - 1))
 
 
 def cagr(x, ann=PY):
-    x = np.asarray(x, float)
-    if not len(x):
-        raise ValueError("收益序列为空")
+    x = _returns(x)
+    if not np.isfinite(ann) or ann <= 0:
+        raise ValueError("年化周期必须为正且有限")
     end = float(np.prod(1 + x))
     return end ** (ann / len(x)) - 1 if end > 0 else -1.0
 

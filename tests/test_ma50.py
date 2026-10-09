@@ -270,17 +270,18 @@ class DataTests(Isolated):
 
 
 class FlowTests(Isolated):
-    def run_flow(self,data=None,acct=None,poss=None,fail=None,orders=None,algos=None,ticker=None):
+    def run_flow(self,data=None,acct=None,poss=None,fail=None,orders=None,algos=None,ticker=None,times=None):
         data=self.data if data is None else data
         account={'totalMarginBalance':'90','availableBalance':'90','multiAssetsMargin':False,'canTrade':True}
         if acct:account.update(acct)
         position_rows=positions() if poss is None else poss
         now=self.now
+        clock_values=iter(times) if times is not None else None
         class FakeBN:
             def __init__(self):pass
             def fapi(self,path,params=None,signed=True):
                 if 'exchangeInfo' in path:return {'symbols':[symbol('BTCUSDT',50,120),symbol()]}
-                if path.endswith('/time'):return {'serverTime':now}
+                if path.endswith('/time'):return {'serverTime':next(clock_values) if clock_values is not None else now}
                 if 'ticker/price' in path:return {'symbol':'ETHUSDT','price':'2700'} if ticker is None else ticker
                 if path.endswith('/openOrders'):
                     if fail=='orders':raise TimeoutError()
@@ -539,5 +540,75 @@ class ClientTests(unittest.TestCase):
             binance_api.BN();handler=opener.call_args.args[0]
             self.assertEqual(handler.proxies['https'],binance_api.PROXY)
 
+
+
+class RiskAuditTests(Isolated):
+    run_flow = FlowTests.run_flow
+    def test_liquidation_distance_uses_position_mark_not_ticker(self):
+        p=positions()
+        p[0].update(markPrice='3000',isolatedWallet='20',isolatedMargin='32',unRealizedProfit='12')
+        out,rec=self.run_flow(poss=p)
+        self.assertIn('相对标记价 -50.0%',out)
+        self.assertEqual(rec['liquidation_distance_pct'],'50.000000')
+        self.assertEqual(rec['mark_price_at_position'],'3000.0')
+        self.assertEqual(rec['isolated_wallet_at_position'],'20.0')
+    def test_missing_mark_is_unknown_not_ticker_fallback(self):
+        out,rec=self.run_flow(poss=positions())
+        self.assertIn('强平距离未知',out)
+        self.assertEqual(rec['liquidation_distance_pct'],'')
+    def test_invalid_mark_and_isolated_equity_pause(self):
+        for change in ({'markPrice':'0'},{'markPrice':'nan'},
+                       {'isolatedWallet':'20','isolatedMargin':'50','unRealizedProfit':'0'}):
+            p=positions();p[0].update(change)
+            with self.subTest(change=change):
+                out,rec=self.run_flow(poss=p)
+                self.assertEqual(rec['validation_status'],'blocked')
+
+
+class ReadinessAuditTests(Isolated):
+    run_flow = FlowTests.run_flow
+    def test_slow_account_query_discards_executable_quantity(self):
+        out,rec=self.run_flow(times=[self.now,self.now,self.now+120001])
+        self.assertEqual(rec['validation_status'],'blocked')
+        self.assertEqual(rec['order_qty'],'')
+        self.assertNotIn('【买入',out)
+        self.assertIn('120秒',out)
+    def test_clock_backwards_blocks(self):
+        _,rec=self.run_flow(times=[self.now,self.now,self.now-1])
+        self.assertEqual(rec['validation_status'],'blocked')
+    def test_rollover_inside_sampling_blocks_old_daily_signal(self):
+        midnight=(self.now//DAY+1)*DAY
+        out,rec=self.run_flow(times=[midnight-1000,midnight-500,midnight+500])
+        self.assertEqual(rec['validation_status'],'blocked')
+        self.assertNotIn('【买入',out)
+        self.assertIn('日线边界',out)
+    def test_fresh_sampling_still_produces_same_order(self):
+        _,a=self.run_flow()
+        _,b=self.run_flow(times=[self.now,self.now,self.now+120000])
+        self.assertEqual(a['order_qty'],b['order_qty'])
+        self.assertEqual(a['validation_status'],b['validation_status'])
+
+class PerformanceMetricAuditTests(unittest.TestCase):
+    def test_sharpe_matches_independent_sample_standard_deviation(self):
+        from align import sharpe
+        values=[.03,-.02,.01,0]
+        mean=sum(values)/len(values)
+        sd=(sum((x-mean)**2 for x in values)/(len(values)-1))**.5
+        self.assertAlmostEqual(sharpe(values),mean/sd*365**.5)
+    def test_cashflow_neutral_deposit_and_initial_drawdown(self):
+        from align import cagr, max_dd
+        r=[90/100-1,209/(90+100)-1]
+        self.assertAlmostEqual(max_dd(r),-.1)
+        self.assertAlmostEqual(cagr(r,ann=2),-.01)
+    def test_invalid_returns_never_publish_performance(self):
+        from align import cagr, max_dd, sharpe
+        for fn in (cagr,max_dd,sharpe):
+            for values in ([],[float('nan')],[float('inf')],[-1.01],[[.01,.02]]):
+                with self.subTest(fn=fn.__name__,values=values):
+                    with self.assertRaises(ValueError):fn(values)
+    def test_complete_loss_stays_complete_loss(self):
+        from align import cagr,max_dd
+        self.assertEqual(cagr([.1,-1,.2]),-1)
+        self.assertEqual(max_dd([.1,-1,.2]),-1)
 
 if __name__=='__main__':unittest.main()

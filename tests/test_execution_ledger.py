@@ -242,5 +242,81 @@ class IntegrationTests(unittest.TestCase):
   code,out=self.cli(['--snapshot'],fail_trade=True)
   self.assertEqual(code,1);self.assertTrue(d.EQ_LOG.exists());self.assertFalse(d.EXECUTION_LOG.exists())
   self.assertIn('同步失败',out)
+
+class AuditRegressionTests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.path=pathlib.Path(self.tmp.name)/'ledger.json'
+ def tearDown(self):self.tmp.cleanup()
+ def test_numeric_auto_margin_flags_rejected(self):
+  for value in (0,1,0.0,1.0,None,'TRUE','0'):
+   p=positions();p[0]['isAutoAddMargin']=value
+   with self.subTest(value=value),self.assertRaises(e.DataError):
+    e.normalize_snapshot(account(),p,NOW-1000,NOW)
+ def test_valid_auto_margin_flags_preserved(self):
+  for value,expected in ((True,True),(False,False),('true',True),('false',False)):
+   p=positions();p[0]['isAutoAddMargin']=value
+   self.assertIs(e.normalize_snapshot(account(),p,NOW-1000,NOW)['positions'][0]['isAutoAddMargin'],expected)
+ def test_old_queryable_gap_is_recovered_and_merged(self):
+  b=e.empty('scope');b['trade_ranges']=[[NOW-8*e.DAY,NOW-7*e.DAY],[NOW-e.DAY,NOW]]
+  e.atomic_write(self.path,json.dumps(b))
+  missed=trade(77,t=NOW-6*e.DAY)
+  result=e.sync_ledger(self.path,API([missed]),'scope',book(),snapshot())
+  self.assertEqual([t['id'] for t in result['trades']],[77])
+  self.assertEqual(result['trade_ranges'],[[NOW-8*e.DAY,NOW]])
+  self.assertEqual(result['runs'][-1]['trade_queries'],[[NOW-7*e.DAY+1,NOW]])
+ def test_gap_outside_retention_is_not_fabricated(self):
+  b=e.empty('scope');b['trade_ranges']=[[NOW-100*e.DAY,NOW-99*e.DAY],[NOW-e.DAY,NOW]]
+  e.atomic_write(self.path,json.dumps(b));api=API()
+  result=e.sync_ledger(self.path,api,'scope',book(),snapshot())
+  self.assertEqual(result['trade_ranges'],[[NOW-100*e.DAY,NOW-99*e.DAY],[NOW-89*e.DAY,NOW]])
+  self.assertTrue(all(c['startTime']>=NOW-89*e.DAY for c in api.calls))
+ def test_failed_gap_query_retains_old_file_and_coverage(self):
+  b=e.empty('scope');b['trade_ranges']=[[NOW-8*e.DAY,NOW-7*e.DAY],[NOW-e.DAY,NOW]]
+  e.atomic_write(self.path,json.dumps(b));before=self.path.read_bytes()
+  class Failed(API):
+   def user_trades(self,**kw):raise TimeoutError('gap')
+  with self.assertRaises(TimeoutError):e.sync_ledger(self.path,Failed(),'scope',book(),snapshot())
+  self.assertEqual(self.path.read_bytes(),before)
+ def result(self,trades,incomes):
+  b=e.empty('scope');b.update(trades=e.normalize_trades(trades),income=e.normalize_income(incomes),
+    trade_ranges=[[NOW-e.DAY,NOW]],income_ranges=[[NOW-e.DAY,NOW]])
+  return b
+ def test_swapped_trade_costs_fail_even_when_totals_match(self):
+  b=self.result([trade(1,commission='.1'),trade(2,commission='.2')],
+    [income(1,value='-.2',tradeId='1'),income(2,value='-.1',tradeId='2')])
+  x=e.summary(b)
+  self.assertEqual(x['reconciliation'][0]['commission_difference_by_asset']['USDT'],'0')
+  self.assertEqual(len(x['reconciliation'][0]['per_trade_differences']),2)
+  self.assertFalse(x['reconciled'])
+ def test_reconciliation_failure_prints_provisional_and_returns_false(self):
+  b=self.result([trade(commission='.2')],[income(value='-.1')]);out=io.StringIO()
+  with contextlib.redirect_stdout(out):ok=e.print_summary(b)
+  self.assertFalse(ok);self.assertIn('暂算净额',out.getvalue())
+ def test_missing_referenced_fill_is_not_reconciled(self):
+  b=self.result([],[income(value='0',tradeId='77')]);x=e.summary(b)
+  self.assertFalse(x['reconciled']);self.assertEqual(x['reconciliation'][0]['income_trade_ids_missing_from_fills'],['77'])
+ def test_absent_trade_id_is_explicit_aggregate_only(self):
+  b=self.result([trade()],[income(tradeId='')]);out=io.StringIO()
+  with contextlib.redirect_stdout(out):e.print_summary(b)
+  self.assertIn('只核对合计',out.getvalue())
+ def test_offline_cost_difference_returns_nonzero(self):
+  b=self.result([trade(commission='.2')],[income(value='-.1')]);e.atomic_write(self.path,json.dumps(b))
+  with patch.object(d,'EXECUTION_LOG',self.path),patch.object(d,'bn_api',side_effect=AssertionError('offline')), \
+       patch.object(sys,'argv',['dd_live.py','--ledger-history']),contextlib.redirect_stdout(io.StringIO()):
+   self.assertEqual(d.main(),1)
+ def test_sync_cost_difference_still_saves_evidence_but_returns_nonzero(self):
+  eq=self.path.parent/'eq.csv';cache=self.path.parent/'income.json'
+  class BN(API):
+   key='fake'
+   def futures_account(self):return account()
+   def positions(self):return positions()
+   def fapi(self,path,p=None,signed=True):
+    return {'serverTime':NOW} if path.endswith('/time') else [income(value='-.1')]
+  with patch.object(d,'EQ_LOG',eq),patch.object(d,'INCOME_CACHE',cache),patch.object(d,'EXECUTION_LOG',self.path), \
+       patch.object(d,'DECISION_LOG',self.path.parent/'decisions.json'),patch.object(d,'bn_api',return_value=BN([trade(commission='.2')])), \
+       patch.object(sys,'argv',['dd_live.py','--snapshot']),contextlib.redirect_stdout(io.StringIO()):
+   self.assertEqual(d.main(),1)
+  self.assertTrue(eq.exists());self.assertEqual(len(e.load_ledger(self.path)['trades']),1)
+
 if __name__=='__main__':unittest.main()
 

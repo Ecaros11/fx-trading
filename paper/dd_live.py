@@ -95,17 +95,31 @@ def confirmed_capital(rows,book,now_ms,override=None):
     return float(baseline['capital'])+cash_total(flows),'已核实快照本金 + 后续USDT转入/转出及兑换资金'
 
 
+def verified_samples(rows,scope):
+    return [r for r in rows if scope and r.get('schema_version')=='2'
+            and r.get('account_scope')==scope and r.get('ts')]
+
 def history_report(rows,book):
     if not rows:print('还没有权益记录。运行 --snapshot 开始采样。');return
-    _,drawdowns,_=observed_drawdowns(rows)
-    nav,note=adjusted_nav(rows,book)
-    print('权益历史（UTC；每行只使用当时及此前的峰值）')
-    print('时刻                          权益USDT    钱包USDT   权益采样回撤    净值采样回撤')
-    for i,row in enumerate(rows):
-        print(f"{row.get('ts') or row['date']:<29} {float(row['equity']):>10.4f} {float(row['wallet']):>10.4f} {percent(drawdowns[i]):>12} {percent(nav[i]['dd'] if nav else None):>14}")
+    scopes={r.get('account_scope') for r in rows if r.get('account_scope')}
+    scope=book.get('account_scope') if book else None
+    if scope and scopes-{scope} or len(scopes)>1:
+        raise DataError('权益历史与流水凭证归属不一致，不能合并')
+    scope=scope or (next(iter(scopes)) if scopes else None)
+    verified=verified_samples(rows,scope)
+    _,drawdowns,_=observed_drawdowns(verified)
+    nav,note=adjusted_nav(verified,book)
+    dds={r['_time']:drawdowns[i] for i,r in enumerate(verified)}
+    navdds={r['_time']:nav[i]['dd'] for i,r in enumerate(verified)} if nav else {}
+    print('权益历史（UTC；峰值和净值只使用当前凭证已核验采样）')
+    print('时刻                          权益USDT    钱包USDT   权益采样回撤    净值采样回撤  归属')
+    for row in rows:
+        state='已核验' if row['_time'] in dds else '旧版/归属未核验'
+        print(f"{row.get('ts') or row['date']:<29} {float(row['equity']):>10.4f} {float(row['wallet']):>10.4f} {percent(dds.get(row['_time'])):>12} {percent(navdds.get(row['_time'])):>14}  {state}")
     print('权益采样回撤包含出入金影响；净值为现金流调整的采样近似。')
     print('净值说明：'+note)
-    if any(r.get('schema_version')!='2' for r in rows):print('旧记录的账户归属和采样时刻未重新核验，保留为旧版记录。')
+    if len(verified)!=len(rows):
+        print('旧记录保留显示，但未核验的账户归属和时刻不参与当前峰值、净值或回撤。')
 
 
 def position_report(rows):
@@ -125,7 +139,7 @@ def position_report(rows):
         print(f'  API强平价 {liquidation:,.2f}；相对标记价 {(liquidation/mark-1)*100:+.2f}%')
 
 
-def main():
+def main(argv=None, result=None):
     for stream in (sys.stdout,sys.stderr):
         if hasattr(stream,'reconfigure'):stream.reconfigure(encoding='utf-8',errors='replace')
     ap=argparse.ArgumentParser(description='USDT账户采样回撤及现金流诊断；只读接口')
@@ -135,7 +149,7 @@ def main():
     group.add_argument('--ledger',action='store_true',help='同步实际成交、成本和持仓保证金账本，不增加DD权益采样')
     group.add_argument('--ledger-history',action='store_true',help='离线查看实际成交与成本账本')
     ap.add_argument('--capital',type=float,help='用户已核实的当前累计净投入USDT（含兑换资金）；不自动把近89天流水当累计本金')
-    a=ap.parse_args()
+    a=ap.parse_args(argv)
     if a.capital is not None and (a.history or a.ledger_history or a.ledger or not math.isfinite(a.capital)):
         ap.error('capital须为有限数，只用于默认诊断或snapshot，不适用于history或ledger模式')
     try:
@@ -143,7 +157,7 @@ def main():
             from execution_ledger import load_ledger, print_summary
             ledger=load_ledger(EXECUTION_LOG)
             if ledger is None: print('还没有实际成交账本；运行 --snapshot 或 --ledger 建立记录。')
-            else: print_summary(ledger)
+            else: return 0 if print_summary(ledger) else 1
             return 0
         if a.history:
             history_report(load_snapshot_rows(EQ_LOG),load_income_cache(INCOME_CACHE));return 0
@@ -155,8 +169,9 @@ def main():
         end_ms=int(bn.fapi('/fapi/v1/time',signed=False)['serverTime'])
         now=dt.datetime.fromtimestamp(end_ms/1000,dt.UTC)
         scope=hashlib.sha256(bn.key.encode()).hexdigest()[:24]
-        rows=load_snapshot_rows(EQ_LOG,scope)
-        if rows and rows[-1]['_time']>end_ms:raise DataError('本地权益记录晚于当前服务器时刻')
+        all_rows=load_snapshot_rows(EQ_LOG,scope)
+        rows=verified_samples(all_rows,scope)
+        if all_rows and all_rows[-1]['_time']>end_ms:raise DataError('本地权益记录晚于当前服务器时刻')
         # Never cache or claim a partial history after a paging/network failure.
         ok,fresh,err=api_retry(lambda:fetch_income(bn,end_ms=end_ms),what='读取完整可见流水')
         if not ok:raise DataError('流水读取不完整：'+err)
@@ -186,11 +201,15 @@ def main():
             print(f'  相对本金盈亏 {eq-capital:+,.4f} USDT；比例 {percent(eq/capital-1) if capital>0 else "本金非正，不计算比例"}')
         print()
         print('回撤口径')
+        print(f"  当前凭证已核验采样 {len(sample_rows)}次；起点 {sample_rows[0].get('ts') or sample_rows[0]['date']}")
         print(f'  权益采样峰值 {peak:,.4f} USDT；权益采样回撤 {percent(dd)}（含出入金影响）')
         print(f'  净值采样回撤 {percent(nav[-1]["dd"] if nav else None)}；'+nav_note)
         print(f'  近89天钱包参考峰值 {wallet_peak:,.4f} USDT；钱包回撤 {percent(wallet_dd)}（不含历史浮盈，含划转）')
         print('  钱包峰值与权益峰值分开计算；没有记录的历史浮盈峰值无法恢复。')
-        if any(r.get('schema_version')!='2' for r in rows):print('  旧快照的账户归属/采样时刻未核验；旧capital不作为已确认本金。')
+        if len(all_rows)!=len(rows):
+            reference_peak,_,reference_dd=observed_drawdowns(all_rows,eq)
+            print(f'  合并旧记录的参考峰值 {reference_peak:.4f} USDT；参考回撤 {percent(reference_dd)}，归属未完全核验，不作为当前账户已核验回撤。')
+            print('  旧快照不参与当前峰值、净值或本金延续；缩小采样范围不代表亏损追回。')
         if dd is not None and peak>0:
             line=threshold_status(eq,peak)
             state='已达到或超过' if line['breached'] else '尚未达到'
@@ -215,10 +234,15 @@ def main():
                     sample_end_ms=int(bn.fapi('/fapi/v1/time',signed=False)['serverTime'])
                     snapshot=normalize_snapshot(acct,positions,sample_start_ms,sample_end_ms)
                     ledger=sync_ledger(EXECUTION_LOG,bn,scope,book,snapshot,DECISION_LOG)
-                    print_summary(ledger)
+                    if result is not None: result['ledger']=ledger
+                    if not print_summary(ledger):
+                        print('成本对账未通过，净额仅为暂算；已保留原始记录供核查。');status=1
                     print(f'实际成交账本已保存：{EXECUTION_LOG}')
                 except Exception as error:
                     print(f'实际成交账本同步失败：{type(error).__name__}: {error}');status=1
+        if result is not None:
+            result.update(account_scope=scope, sampled_ms=end_ms, equity=eq, observed_dd=dd,
+                          nav_dd=nav[-1]['dd'] if nav else None, income=book)
         print('权益采样未捕获日内全部峰值；现金流调整是采样近似，不能据此证明没有强平风险。')
         return status
     except Exception as error:

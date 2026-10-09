@@ -25,9 +25,14 @@ $env:HTTPS_PROXY = "http://127.0.0.1:1080"
 日常命令：
 
 ```powershell
-uv run --locked paper/ma50_live.py --console --check --archive
+uv run --locked paper/ma50_live.py --daily
+# 实际成交后再采样
 uv run --locked paper/dd_live.py --snapshot
 ```
+
+--daily一次完成DD权益采样、成交/成本同步、最新MA50检查、同日执行核对、建议归档与报告保存；控制台先给操作摘要。--daily --console可同时显示完整明细。原来的--console --check --archive仍可单独使用。
+
+同日核对按北京时间08:00至次日08:00的日线执行周期，区分运行次数、实际成交笔数及订单数。数量与上次建议相符只是候选关联，不代表已确认策略归属；查询截止之后的成交尚未核验。同日已有成交时普通新建议标为先复核；退出和超仓减仓不会因运行过而被隐藏。未知覆盖、同步/归档失败或需复核时返回非零状态，成功步骤及报告保留。
 
 其他模式：
 
@@ -56,6 +61,7 @@ MA50 使用 UTC 日线，检查时点为每天 UTC 00:00 之后，即北京时�
 |---|---|---|---|
 | `ma50_live.py` | 根目录 `binance_api.py`；同目录 `ma50_core.py`；归档需要 `execution_ledger.py` 和 `dd_support.py`；自检和同步统计表需要 `align.py` | NumPy | `.env`；ETH 日线、资金费；交易规则缓存；信号日志 |
 | `dd_live.py` | 根目录 `binance_api.py`；同目录 `dd_support.py`、`execution_ledger.py` | 无，全部使用标准库 | `.env`；权益快照日志 |
+| `daily_check.py` | MA50的--daily内部模块；串联dd_live和execution_ledger，输出同日核对及摘要 | 无新增依赖 | 逐次建议、执行账本、独立daily报告 |
 | `align.py` | 与实时工具共用 `ma50_core.py` 的策略和订单校验 | NumPy | 无额外数据文件，由调用方传入 |
 | `binance_api.py` | 无其他项目模块 | 无，HTTP、签名和 JSON 均使用标准库 | 根目录 `.env` |
 
