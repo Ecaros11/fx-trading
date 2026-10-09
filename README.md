@@ -3,7 +3,7 @@
 项目只保留两个命令行工具及其运行依赖：
 
 - `paper/ma50_live.py`：ETHUSDT 日线 MA50 信号、目标仓位、手动调仓建议、报告与信号归档。
-- `paper/dd_live.py`：读取合约账户，计算已核实本金盈亏、权益/钱包及现金流调整的采样回撤，并保存权益快照。
+- `paper/dd_live.py`：读取合约账户，计算已核实本金盈亏、权益/钱包及现金流调整的采样回撤，并保存权益快照、实际成交与成本账本。
 
 ## 安装与运行
 
@@ -40,6 +40,8 @@ uv run --locked paper/ma50_live.py --sync-methods
 uv run --locked paper/ma50_live.py --console --check --target-vol 25
 uv run --locked paper/dd_live.py
 uv run --locked paper/dd_live.py --history
+uv run --locked paper/dd_live.py --ledger
+uv run --locked paper/dd_live.py --ledger-history
 ```
 
 也可以进入 `paper` 目录后按原来的方式运行 `uv run ma50_live.py ...` / `uv run dd_live.py ...`；uv 会向上查找根目录配置。
@@ -52,8 +54,8 @@ MA50 使用 UTC 日线，检查时点为每天 UTC 00:00 之后，即北京时�
 
 | 工具/模块 | 项目内依赖 | 第三方库 | 本地文件 |
 |---|---|---|---|
-| `ma50_live.py` | 根目录 `binance_api.py`；同目录 `ma50_core.py`；自检和同步统计表需要 `align.py` | NumPy | `.env`；ETH 日线、资金费；交易规则缓存；信号日志 |
-| `dd_live.py` | 根目录 `binance_api.py`；同目录 `dd_support.py` | 无，全部使用标准库 | `.env`；权益快照日志 |
+| `ma50_live.py` | 根目录 `binance_api.py`；同目录 `ma50_core.py`；归档需要 `execution_ledger.py` 和 `dd_support.py`；自检和同步统计表需要 `align.py` | NumPy | `.env`；ETH 日线、资金费；交易规则缓存；信号日志 |
+| `dd_live.py` | 根目录 `binance_api.py`；同目录 `dd_support.py`、`execution_ledger.py` | 无，全部使用标准库 | `.env`；权益快照日志 |
 | `align.py` | 与实时工具共用 `ma50_core.py` 的策略和订单校验 | NumPy | 无额外数据文件，由调用方传入 |
 | `binance_api.py` | 无其他项目模块 | 无，HTTP、签名和 JSON 均使用标准库 | 根目录 `.env` |
 
@@ -69,6 +71,9 @@ MA50 使用 UTC 日线，检查时点为每天 UTC 00:00 之后，即北京时�
 | `data/funding/ETHUSDT.json` | 历史资金费、成本和回测 | 运行时增量刷新；保留已有完整历史 |
 | `data/live/exchange_rules.json` | 交易规则的离线回退缓存 | 联网读取成功时更新 |
 | `data/live/ma50_log.csv` | 实际信号归档和前向检验记录 | 历史执行记录需要保留 |
+| `data/live/ma50_decisions.json` | 升级后逐次建议时刻、参考价和规则版本 | 不补造旧时刻；保留本地文件 |
+| `data/live/execution_ledger.json` | 实际成交、成本、查询范围和逐仓快照 | 首次近89天，后续增量；保留本地历史 |
+| `data/live/execution_*.csv` | 成交、流水和逐仓采样导出 | JSON为权威记录，同步后重新导出 |
 | `data/live/equity_log.csv` | 含浮动盈亏的权益快照 | 历史快照需要保留 |
 | `data/live/dd_income.json` | DD完整流水及覆盖区间缓存 | 默认DD运行成功后更新；断档不当作零流水 |
 
@@ -93,3 +98,9 @@ uv run --locked paper/ma50_live.py --selfcheck --offline
 ## DD口径
 
 DD默认联网查询并更新流水缓存；`--snapshot`才增加权益采样，同一天多次记录保留；`--history`完全离线。API流水默认最近7天、最多保留近3个月，工具显式拉取89天并完整分页，不再声称可自动获得全部账户累计本金。已核实本金可用`--capital`配合`--snapshot`建立基准；未知时明确显示无法核实。钱包、权益采样与现金流调整后的净值采样回撤分开展示，详细计算和限制见 `dd_rules.md`。
+
+## 实际成交与成本记录
+
+--snapshot现在同时同步ETHUSDT实际成交、手续费、资金费和逐仓采样；实际交易后再运行一次，保留交易后状态。--ledger只同步账本，--ledger-history完全离线。MA50的--archive另保存每次建议的时刻、参考价与规则版本，原每日CSV仍取最新建议。
+
+成本按共同覆盖区间计算“已实现盈亏－USDT成交手续费＋ETH资金费”，与流水对账，不重复扣费。非USDT手续费不混加，候选关联不是已确认执行。净额不含浮盈亏，不是账户总收益或策略夏普。详见[实际成交记录说明](execution_rules.md)。

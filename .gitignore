@@ -20,3 +20,8 @@ credentials.json
 data/reports/
 *.tmp
 *.lock
+
+# Private execution evidence and derived exports
+data/live/execution_ledger.json
+data/live/execution_*.csv
+data/live/ma50_decisions.json

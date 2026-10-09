@@ -20,6 +20,8 @@ from dd_support import (DataError, number, account_values, fetch_income, total, 
     observed_drawdowns, adjusted_nav, threshold_status, DAY)
 EQ_LOG = ROOT / "data" / "live" / "equity_log.csv"
 INCOME_CACHE = ROOT / "data" / "live" / "dd_income.json"
+EXECUTION_LOG = ROOT / 'data' / 'live' / 'execution_ledger.json'
+DECISION_LOG = ROOT / 'data' / 'live' / 'ma50_decisions.json'
 
 
 def api_retry(fn, what="", tries=3, base=1.5):
@@ -130,14 +132,23 @@ def main():
     group=ap.add_mutually_exclusive_group()
     group.add_argument('--snapshot',action='store_true',help='保存本次权益采样，保留同日其他采样')
     group.add_argument('--history',action='store_true',help='离线查看本地权益历史与流水缓存')
+    group.add_argument('--ledger',action='store_true',help='同步实际成交、成本和持仓保证金账本，不增加DD权益采样')
+    group.add_argument('--ledger-history',action='store_true',help='离线查看实际成交与成本账本')
     ap.add_argument('--capital',type=float,help='用户已核实的当前累计净投入USDT（含兑换资金）；不自动把近89天流水当累计本金')
     a=ap.parse_args()
-    if a.capital is not None and (a.history or not math.isfinite(a.capital)):
-        ap.error('capital须为有限数，且不适用于离线history')
+    if a.capital is not None and (a.history or a.ledger_history or a.ledger or not math.isfinite(a.capital)):
+        ap.error('capital须为有限数，只用于默认诊断或snapshot，不适用于history或ledger模式')
     try:
+        if a.ledger_history:
+            from execution_ledger import load_ledger, print_summary
+            ledger=load_ledger(EXECUTION_LOG)
+            if ledger is None: print('还没有实际成交账本；运行 --snapshot 或 --ledger 建立记录。')
+            else: print_summary(ledger)
+            return 0
         if a.history:
             history_report(load_snapshot_rows(EQ_LOG),load_income_cache(INCOME_CACHE));return 0
         bn=bn_api()
+        sample_start_ms=int(bn.fapi('/fapi/v1/time',signed=False)['serverTime'])
         ok,acct,err=api_retry(bn.futures_account,what='读账户')
         if not ok:raise DataError('账户读取失败：'+err)
         eq,wallet,unreal=account_values(acct)
@@ -195,6 +206,19 @@ def main():
             n=save_snapshot(eq,wallet,unreal,capital,now,scope,
                 'user_verified' if a.capital is not None else 'verified_baseline_plus_transfers')
             print(f'已保存本次采样：{EQ_LOG}（共{n}次，不覆盖同日较早采样）')
+        if a.snapshot or a.ledger:
+            if not ok:
+                print('实际成交账本未同步：持仓采样失败。');status=1
+            else:
+                try:
+                    from execution_ledger import normalize_snapshot, sync_ledger, print_summary
+                    sample_end_ms=int(bn.fapi('/fapi/v1/time',signed=False)['serverTime'])
+                    snapshot=normalize_snapshot(acct,positions,sample_start_ms,sample_end_ms)
+                    ledger=sync_ledger(EXECUTION_LOG,bn,scope,book,snapshot,DECISION_LOG)
+                    print_summary(ledger)
+                    print(f'实际成交账本已保存：{EXECUTION_LOG}')
+                except Exception as error:
+                    print(f'实际成交账本同步失败：{type(error).__name__}: {error}');status=1
         print('权益采样未捕获日内全部峰值；现金流调整是采样近似，不能据此证明没有强平风险。')
         return status
     except Exception as error:

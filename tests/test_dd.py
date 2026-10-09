@@ -183,7 +183,8 @@ class CLITests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.root=pathlib.Path(self.tmp.name);self.stack=contextlib.ExitStack()
         self.stack.enter_context(patch.object(d,'EQ_LOG',self.root/'eq.csv'));self.stack.enter_context(patch.object(d,'INCOME_CACHE',self.root/'income.json'))
-        self.account={'multiAssetsMargin':False,'totalMarginBalance':'90','totalWalletBalance':'100','totalUnrealizedProfit':'-10'}
+        self.stack.enter_context(patch.object(d,'EXECUTION_LOG',self.root/'execution.json'));self.stack.enter_context(patch.object(d,'DECISION_LOG',self.root/'decisions.json'))
+        self.account={'multiAssetsMargin':False,'totalMarginBalance':'90','totalWalletBalance':'100','totalUnrealizedProfit':'-10','availableBalance':'50'}
     def tearDown(self):self.stack.close();self.tmp.cleanup()
     def run_cli(self,args=(),account=None,rows=None,fail=None):
         acct=self.account if account is None else account
@@ -196,7 +197,11 @@ class CLITests(unittest.TestCase):
                 if path.endswith('/time'):return {'serverTime':NOW}
                 if fail=='income':raise TimeoutError('income')
                 return [] if rows is None else rows
-            def positions(self):return []
+            def positions(self):
+                return [dict(symbol='ETHUSDT',positionSide='BOTH',positionAmt='0',entryPrice='0',markPrice='2000',
+                   liquidationPrice='0',isolatedWallet='0',isolatedMargin='0',unRealizedProfit='0',
+                   marginType='isolated',leverage='3',isAutoAddMargin='false',updateTime=NOW)]
+            def user_trades(self,**kwargs):return []
         out=io.StringIO()
         # Deterministic retry without sleeps or network.
         original=d.api_retry

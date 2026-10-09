@@ -22,6 +22,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from ma50_core import (ExchangeRules, PositionState, parse_positions, plan_order,
                        strategy_position, finite, max_position, OrderPlan)
 import tempfile
+import hashlib
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict
 import ma50_core as strategy
@@ -145,14 +147,14 @@ VOL_ACHIEVE = 0.89
 
 
 SE_SHARPE = 0.387
-SAMPLE_YEARS = 6.7
-SAMPLE_DAYS = 2447
+SAMPLE_YEARS = 6.71
+SAMPLE_DAYS = 2448
 FEE_PER_SIDE = strategy.FEE
 
 
-METHODS_ASOF = '2026-10-08'
+METHODS_ASOF = '2026-10-09'
 
-METHODS = [('固定参考 1.405x', None, 6.7, 1.1329, -0.727), ('波动率目标 60%', 0.6, 31.7, 1.2487, -0.543), ('波动率目标 40%', 0.4, 47.5, 1.2379, -0.393), ('波动率目标 25%', 0.25, 76.1, 1.2391, -0.26), ('波动率目标 15%', 0.15, 126.8, 1.2387, -0.162)]
+METHODS = [('固定参考 1.405x', None, 6.7, 1.1211, -0.727), ('波动率目标 60%', 0.6, 31.7, 1.2296, -0.543), ('波动率目标 40%', 0.4, 47.5, 1.2191, -0.393), ('波动率目标 25%', 0.25, 76.1, 1.2204, -0.26), ('波动率目标 15%', 0.15, 126.8, 1.22, -0.162)]
 
 
 DD_BY_LEV = [(0.8, -0.498), (1.0, -0.585), (1.2, -0.661), (1.405, -0.727), (1.6, -0.779), (2.0, -0.862)]
@@ -202,6 +204,7 @@ FIELDS = [
 ]
 
 FIELDS += ["rebalance_policy","soft_rebalance_pct","trend_signal","decision_reason","side","position_side","reduce_only","order_qty","target_qty","validation_status","price_return_1d","price_return_7d","price_return_10d","price_return_30d","price_drawdown_10d"]
+FIELDS += ["decision_id","decision_ms","decision_at","account_scope","reference_price","reference_price_ms","rule_version"]
 
 
 def _atomic_write(path, text, encoding="utf-8"):
@@ -523,6 +526,7 @@ def run(a):
 
     now = dt.datetime.now()
     bd = dt.datetime.fromtimestamp(sig["bar_t"] / 1000, dt.UTC)
+    reference_price_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
     ticker = bn.fapi("/fapi/v1/ticker/price", {"symbol": SYM}, signed=False)
     if ticker.get("symbol",SYM)!=SYM: raise DataError("实时价格标的错误")
     price = finite(ticker["price"],"实时价格",0)
@@ -666,7 +670,17 @@ def run(a):
     A("  历史统计使用日线开盘价近似成交与逐次资金费；不构成真实成交或零强平验证")
     A("")
 
+    decision_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
+    rule_config = dict(ma=MA_WINDOW,vol=VOL_WINDOW,target_vol=adv.get("target_vol"),
+                       vol_cap=strategy.VOL_CAP,leverage=strategy.MAX_LEVERAGE,
+                       rebalance_pct=strategy.SOFT_REBALANCE,rules=asdict(current_rules()))
+    rule_version = hashlib.sha256(pathlib.Path(strategy.__file__).read_bytes() +
+                                  json.dumps(rule_config,sort_keys=True).encode()).hexdigest()
     rec = {
+        "decision_id":uuid.uuid4().hex,"decision_ms":str(decision_ms),
+        "decision_at":dt.datetime.fromtimestamp(decision_ms/1000,dt.UTC).isoformat(),
+        "account_scope":hashlib.sha256(bn.key.encode()).hexdigest()[:24] if getattr(bn,"key",None) else "",
+        "reference_price":str(price),"reference_price_ms":str(reference_price_ms),"rule_version":rule_version,
         "symbol":SYM,"date":bd.strftime("%Y-%m-%d"),"bar_ms":str(sig["bar_t"]),
         "bar_close":f"{sig['close']:.2f}","ma50":f"{sig['ma50']:.2f}","dist_ma50_pct":f"{sig['dist_pct']:.2f}",
         "signal":"做多" if sig["long"] else "空仓","trend_signal":"做多" if sig["trend_long"] else "空仓",
@@ -736,6 +750,9 @@ def save_archive(rows):
 
 
 def do_archive(rec):
+    # Authoritative per-run evidence; daily CSV remains a convenient latest-day view.
+    from execution_ledger import append_decision
+    append_decision(ARCHIVE.with_name("ma50_decisions.json"),rec)
     with archive_lock():
         rows=load_archive();hit=next((i for i,r in enumerate(rows) if r.get("date")==rec["date"]),None)
         if hit is not None:

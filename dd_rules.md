@@ -1,11 +1,11 @@
 # DD工具规则与数据口径
 
-`paper/dd_live.py` 提供USDT账户本金诊断、钱包回撤、权益采样回撤和现金流调整后的净值采样回撤。只读取交易所，不下单或修改账户；运行依赖 `paper/dd_support.py` 和根目录 `binance_api.py`，全部使用Python标准库。
+`paper/dd_live.py` 提供USDT账户本金诊断、钱包回撤、权益采样回撤和现金流调整后的净值采样回撤。只读取交易所，不下单或修改账户；运行依赖 `paper/dd_support.py`、`paper/execution_ledger.py` 和根目录 `binance_api.py`，全部使用Python标准库。
 
 ## 运行
 
 - 默认：`uv run --locked paper/dd_live.py`，读取账户与完整可见流水，更新本地流水缓存，显示回撤；不写权益快照。
-- 采样：`uv run --locked paper/dd_live.py --snapshot`，增加本次权益记录；同一天的早先记录保留。
+- 采样：`uv run --locked paper/dd_live.py --snapshot`，增加本次权益记录，同时同步实际成交、成本与逐仓采样；同一天的早先记录保留。
 - 历史：`uv run --locked paper/dd_live.py --history`，只读本地记录和流水缓存，不联网、不需要密钥。
 - 确认本金：`--capital 数值` 表示用户已核实的当前累计净投入USDT，包含进入USDT范围的兑换资金。与`--snapshot`一起使用可建立已核实本金基准，随后在流水完整覆盖时按后续划转和兑换资金延续；无可靠基准时显示“无法核实”。不要把接口仅可见区间的金额当作全部历史本金。
 
@@ -45,3 +45,7 @@ r = (期末权益 - 期初权益 - 现金流净额) / (期初权益 + 各现金�
 账户、流水、持仓来自多次只读请求，不是原子快照。历史采样回撤不能证明不存在强平风险。DD的时间戳在同步时钟后留5秒读请求余量，缓解代理延迟不对称造成的签名时间戳超前，不影响MA50的共享客户端。
 
 来源：[币安账户与流水接口](https://developers.binance.com/en/docs/catalog/core-trading-derivatives-trading-usd-s-m-futures/api/rest-api/account)、[GIPS资金流调整收益方法说明](https://www.gipsstandards.org/standards/gips-standards-for-firms/gips-standards-handbook-for-firms/)。这里只采用其方法说明，不声称工具符合GIPS标准。
+
+## 实际成交与成本账本
+
+--ledger只同步成交/成本/风险账本，不增加DD权益CSV；--ledger-history只读本地，不联网。原回撤/本金口径不变。权益采样和成交同步分别保存；成交同步失败返回非零状态，已验证的权益采样保留。首次请求近89天，后续成交增量重叠3天，覆盖以外不视为空。详见[实际成交记录说明](execution_rules.md)。

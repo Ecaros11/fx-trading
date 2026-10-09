@@ -241,7 +241,7 @@ class BN:
             start = int(r[-1]["time"]) + 1
         return rows
 
-    def user_trades(self, symbol="BTCUSDT", limit=50, **kw):
+    def user_trades(self, symbol="ETHUSDT", limit=50, **kw):
         p = {"symbol": symbol, "limit": limit}
         p.update(kw)
         return self.fapi("/fapi/v1/userTrades", p)
