@@ -1,9 +1,18 @@
-"""Shared MA50 decisions and exchange constraints; contains no network or writes."""
+"""Shared B daily signals and exchange constraints; no network or writes."""
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 import math
+import statistics
 
-MA_WINDOW = 50
+MA_WINDOW = 50  # Legacy diagnostic period; B decisions use ENTRY/EXIT_MA_WINDOW.
+STRATEGY_ID = "B_ma35_in_ma40_out_volume10_vwma10_v1"
+C25_STRATEGY_ID = "B_C25_down3_sd5_30_125_memory2_v1"
+C25_CONFIG = dict(down=3, short=5, long=30, threshold=1.25, factor=.25, memory=2)
+ENTRY_MA_WINDOW = 35
+EXIT_MA_WINDOW = 40
+VOLUME_WINDOW = 10
+VWMA_WINDOW = 10
+SIGNAL_LOOKBACK = max(ENTRY_MA_WINDOW, EXIT_MA_WINDOW, VOLUME_WINDOW + 1)
 VOL_WINDOW = 10
 TARGET_VOL = 0.60
 VOL_CAP = 1.20
@@ -21,6 +30,87 @@ def finite(value, name, minimum=None):
 
 def decimal(value):
     return Decimal(str(value))
+
+
+def signal_indicators(bars):
+    """Only completed bars supplied by the caller; volume is ETH base volume."""
+    if len(bars) < SIGNAL_LOOKBACK:
+        raise ValueError("B信号至少需要40根完成日线")
+    tail = bars[-SIGNAL_LOOKBACK:]
+    closes = [finite(b["c"], "收盘", 0) for b in tail]
+    volumes = [finite(b["v"], "ETH成交量", 0) for b in tail]
+    if min(closes) <= 0:
+        raise ValueError("收盘价必须为正")
+    baseline = math.fsum(volumes[-VOLUME_WINDOW-1:-1]) / VOLUME_WINDOW
+    denominator = math.fsum(volumes[-VWMA_WINDOW:])
+    if baseline <= 0 or denominator <= 0:
+        raise ValueError("量能均值或VWMA成交量分母无效")
+    return dict(close=closes[-1],
+                ma35=math.fsum(closes[-ENTRY_MA_WINDOW:])/ENTRY_MA_WINDOW,
+                ma40=math.fsum(closes[-EXIT_MA_WINDOW:])/EXIT_MA_WINDOW,
+                volume=volumes[-1], volume_mean10=baseline,
+                volume_ratio10=volumes[-1]/baseline,
+                vwma10=math.fsum(c*v for c,v in zip(closes[-VWMA_WINDOW:],volumes[-VWMA_WINDOW:]))/denominator)
+
+
+def signal_decision(indicators, held_qty, rvol):
+    """Select entry or exit from verified actual quantity, never virtual signals."""
+    if held_qty is None:
+        return None, "position_unknown", "unknown"
+    held_qty = finite(held_qty, "实际多仓", 0)
+    rvol = finite(rvol, "已实现波动", 0)
+    if rvol <= 0:
+        raise ValueError("波动率必须为正")
+    branch = "holding" if held_qty > 0 else "entry"
+    if rvol > VOL_CAP:
+        return False, "vol_cap", branch
+    if held_qty > 0:
+        active = indicators["close"] > indicators["ma40"]
+        return active, "in_market" if active else "exit_ma40", branch
+    for ok, reason in ((indicators["close"] > indicators["ma35"], "entry_ma35"),
+                       (indicators["volume_ratio10"] >= 1, "entry_volume"),
+                       (indicators["close"] > indicators["vwma10"], "entry_vwma")):
+        if not ok:
+            return False, reason, branch
+    return True, "in_market", branch
+
+
+def c25_indicators(bars):
+    """C25 uses latest TWO closed-bar triggers, never invocation count.
+
+    down3 means close[t] < close[t-3], not three consecutive down days.
+    Sample SD of simple close-to-close returns; factor applies BEFORE caps.
+    Caller supplies completed bars only, just as for the B indicators.
+    """
+    required = C25_CONFIG['long'] + C25_CONFIG['memory']
+    if len(bars) < required:
+        raise ValueError("C25至少需要32根完成日线")
+    tail = bars[-required:]
+    times = [finite(b['t'], "C25日线时刻", 0) for b in tail]
+    if any(isinstance(b['t'],bool) for b in tail) or any(not t.is_integer() or t % 86400000 for t in times) or any(
+            t-u != 86400000 for u,t in zip(times,times[1:])):
+        raise ValueError("C25日线有缺口、重复或时刻无效")
+    closes = [finite(b['c'], "C25收盘", 0) for b in tail]
+    if min(closes) <= 0:
+        raise ValueError("C25收盘必须为正")
+    returns = [closes[i]/closes[i-1]-1 for i in range(1,len(closes))]
+    checks=[]
+    for lag in (0,1):
+        end = len(returns)-lag
+        sd5 = statistics.stdev(returns[end-5:end])*math.sqrt(365)
+        sd30 = statistics.stdev(returns[end-30:end])*math.sqrt(365)
+        index = len(closes)-1-lag
+        down = closes[index] < closes[index-3]
+        checks.append(dict(bar_ms=int(times[index]), down3=down,
+                           sd5=sd5, sd30=sd30,
+                           ratio=sd5/sd30 if sd30 else None,
+                           trigger=down and sd5 > 1.25*sd30))
+    active = any(x['trigger'] for x in checks)
+    latest,previous=checks
+    return dict(c25_active=active,c25_factor=.25 if active else 1.,
+                c25_trigger=latest['trigger'],c25_previous_trigger=previous['trigger'],
+                c25_down3=latest['down3'],c25_sd5=latest['sd5'],c25_sd30=latest['sd30'],
+                c25_ratio=latest['ratio'],c25_previous_bar_ms=previous['bar_ms'])
 
 
 def validate_funding(rows, start_ms=None, end_ms=None, interval_hours=8):

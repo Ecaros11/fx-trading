@@ -195,7 +195,7 @@ class WorkflowTests(unittest.TestCase):
         p=self.live.ARCHIVE.with_name('ma50_decisions.json');p.parent.mkdir(parents=True);p.write_text('{broken')
         self.assertEqual(self.invoke(),1);self.assertIn('同日记录无法核对',self.output)
     def test_daily_dispatch_uses_configured_target_and_forbids_other_modes(self):
-        with patch.object(sys,'argv',['ma50_live.py','--daily','--target-vol','40']),patch.object(daily,'run_daily',return_value=0) as call:
+        with patch.object(sys,'argv',['ma50_live.py','--daily','--risk-overlay','none','--target-vol','40']),patch.object(daily,'run_daily',return_value=0) as call,patch.object(ma,'RISK_OVERLAY','none'):
             old=ma.TARGET_VOL_OVERRIDE
             try:
                 self.assertEqual(ma.main(),0);self.assertEqual(ma.TARGET_VOL_OVERRIDE,.4);call.assert_called_once()

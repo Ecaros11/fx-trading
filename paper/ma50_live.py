@@ -1,8 +1,9 @@
-"""ETHUSDT MA50 manual trading tool.
+"""ETHUSDT B+C25 daily manual trading tool (legacy command name ma50_live.py).
 
-Daily completed close above MA50 and realized volatility at most 120% permits
-long exposure. Default target volatility is 60%. All quantities pass shared
+Flat: MA35 + previous-10-day volume + VWMA10 entry; held: MA40 exit.
+Default 10-day target volatility is 60%, with a 120% exit cap. Quantities pass shared
 exchange/account constraints before display and archive. No orders are sent.
+C25 is the default: down3 and SD5/30>1.25, 25% budget, latest two closed bars.
 See README.md for CLI modes and ma50_rules.md for accounting assumptions.
 """
 import argparse
@@ -10,6 +11,7 @@ import csv
 import datetime as dt
 import os
 import json
+import math
 import pathlib
 import sys
 
@@ -77,6 +79,7 @@ def load_funding():
 
 SYM = "ETHUSDT"
 MA_WINDOW = strategy.MA_WINDOW
+SIGNAL_LOOKBACK = strategy.SIGNAL_LOOKBACK
 
 
 VOL_WINDOW = strategy.VOL_WINDOW
@@ -131,33 +134,32 @@ SOFT_REBALANCE_PCT = strategy.SOFT_REBALANCE
 MMR = 0.004
 
 
-WORST_TRADE_LOW = -0.266
-WORST_TRADE_CLOSE = -0.245
-
-
-MAX_SAFE_LEV = 3
-
-
 TARGET_VOL_OVERRIDE = DEFAULT_TARGET_VOL
 
 TARGET_VOL_EXPLICIT = False
+DEFAULT_RISK_OVERLAY = "c25"
+RISK_OVERLAY = DEFAULT_RISK_OVERLAY
 
 
-VOL_ACHIEVE = 0.89
+def strategy_id():
+    return strategy.C25_STRATEGY_ID if RISK_OVERLAY == "c25" else strategy.STRATEGY_ID
 
 
-SE_SHARPE = 0.387
+def strategy_label():
+    return "B＋C25" if RISK_OVERLAY == "c25" else "B"
+
+
 SAMPLE_YEARS = 6.71
-SAMPLE_DAYS = 2448
+SAMPLE_DAYS = 2450
 FEE_PER_SIDE = strategy.FEE
 
 
-METHODS_ASOF = '2026-10-09'
+METHODS_ASOF = '2026-10-11'
 
-METHODS = [('固定参考 1.405x', None, 6.7, 1.1211, -0.727), ('波动率目标 60%', 0.6, 31.7, 1.2296, -0.543), ('波动率目标 40%', 0.4, 47.5, 1.2191, -0.393), ('波动率目标 25%', 0.25, 76.1, 1.2204, -0.26), ('波动率目标 15%', 0.15, 126.8, 1.22, -0.162)]
+METHODS = [('固定参考 1.405x', None, 6.7, 1.3347, -0.581), ('波动率目标 60%', 0.6, 30.9, 1.4025, -0.471), ('波动率目标 40%', 0.4, 46.4, 1.3872, -0.336), ('波动率目标 25%', 0.25, 74.3, 1.3885, -0.22), ('波动率目标 15%', 0.15, 123.8, 1.3881, -0.136)]
 
 
-DD_BY_LEV = [(0.8, -0.498), (1.0, -0.585), (1.2, -0.661), (1.405, -0.727), (1.6, -0.779), (2.0, -0.862)]
+DD_BY_LEV = [(0.8, -0.358), (1.0, -0.428), (1.2, -0.507), (1.405, -0.581), (1.6, -0.646), (2.0, -0.758)]
 
 
 def dd_for_lev(lev):
@@ -206,6 +208,10 @@ FIELDS = [
 FIELDS += ["rebalance_policy","soft_rebalance_pct","trend_signal","decision_reason","side","position_side","reduce_only","order_qty","target_qty","validation_status","price_return_1d","price_return_7d","price_return_10d","price_return_30d","price_drawdown_10d"]
 FIELDS += ["held_qty_at_signal","available_at_signal","daily_check_status","daily_prior_runs","daily_fill_count","daily_ledger_cutoff_ms"]
 FIELDS += ["decision_id","decision_ms","decision_at","account_scope","reference_price","reference_price_ms","rule_version","mark_price_at_position","liquidation_price_at_position","liquidation_distance_pct","isolated_wallet_at_position","isolated_margin_at_position"]
+FIELDS += ["strategy_id","signal_branch","ma35","ma40","vwma10","volume","volume_mean10","volume_ratio10","entry_eligible","holding_eligible"]
+FIELDS += ["risk_overlay","base_target_vol","risk_budget_factor","c25_active","c25_trigger",
+           "c25_previous_trigger","c25_down3","c25_sd5","c25_sd30","c25_ratio","c25_previous_bar_ms"]
+FIELDS += ["execution_guard"]
 
 
 def _atomic_write(path, text, encoding="utf-8"):
@@ -375,16 +381,22 @@ def funding_settle_count():
     return result
 
 
-def signal_of(bars):
-    if len(bars)<MA_WINDOW: return None
-    c = np.array([b["c"] for b in bars],float); average = ma(c,MA_WINDOW)
-    rv = realized_vol(bars); prior_vol = realized_vol(bars[:-1])
+def signal_of(bars, held_qty=None):
+    if len(bars)<SIGNAL_LOOKBACK: return None
+    indicators = strategy.signal_indicators(bars)
+    rv = realized_vol(bars)
     if not np.isfinite(rv) or rv<=0: raise DataError("波动率无效")
-    trend = bool(c[-1]>average[-1]); active = trend and (VOL_CAP is None or rv<=VOL_CAP)
-    prior = (bool(c[-2]>average[-2]) and np.isfinite(prior_vol) and prior_vol>0 and (VOL_CAP is None or prior_vol<=VOL_CAP)) if np.isfinite(average[-2]) else None
-    return {"bars":bars,"close":float(c[-1]),"ma50":float(average[-1]),
-        "dist_pct":float((c[-1]/average[-1]-1)*100),"trend_long":trend,"long":bool(active),
-        "prev_long":prior,"rvol":rv,"reason":"trend_off" if not trend else ("vol_cap" if not active else "in_market"),"bar_t":bars[-1]["t"]}
+    active, reason, branch = strategy.signal_decision(indicators, held_qty, rv)
+    entry = strategy.signal_decision(indicators, 0, rv)[0]
+    holding = strategy.signal_decision(indicators, 1, rv)[0]
+    overlay = strategy.c25_indicators(bars) if RISK_OVERLAY == "c25" else {}
+    # Legacy MA50 fields remain actual MA50 diagnostics, never relabeled MA35/40.
+    legacy_ma = math.fsum(b["c"] for b in bars[-MA_WINDOW:])/MA_WINDOW if len(bars)>=MA_WINDOW else None
+    return indicators | overlay | {"bars":bars,"ma50":legacy_ma,
+        "dist_pct":(indicators['close']/legacy_ma-1)*100 if legacy_ma else None,
+        "trend_long":active,"long":active,"prev_long":None,"signal_branch":branch,
+        "entry_eligible":entry,"holding_eligible":holding,
+        "rvol":rv,"reason":reason,"bar_t":bars[-1]["t"]}
 
 
 def pick_method(equity):
@@ -446,12 +458,20 @@ def leverage_plan(equity, position, notional):
             "lev_ok":True}
 
 
-def advice(equity, price, rvol=None, trend_long=True, fee=None):
+def advice(equity, price, rvol=None, trend_long=True, fee=None, budget_factor=1.):
     fee = FEE_PER_SIDE if fee is None else fee
     try:
         equity = finite(equity,"权益",0); price = finite(price,"价格",0)
         if equity<=0 or price<=0: raise ValueError("价格和权益必须为正")
-        name,tv,need,sh,dd,nxt,gap = pick_method(equity)
+        if RISK_OVERLAY == "c25":
+            # C25 must not depend on the old B performance table, even for sizing.
+            name,tv="B＋C25风险预算",TARGET_VOL_OVERRIDE
+            need=sh=dd=nxt=gap=None
+        else:
+            name,tv,need,sh,dd,nxt,gap = pick_method(equity)
+        budget_factor = finite(budget_factor,"预算系数",0)
+        if budget_factor not in (1.,.25): raise ValueError("预算系数无效")
+        if tv is not None: tv *= budget_factor
         position,reason = strategy_position(trend_long,rvol,equity,tv,fee,VOL_CAP,MIN_NOTIONAL)
         notional = equity*position
         fail = "notional" if position>0 and notional<MIN_NOTIONAL else None
@@ -459,7 +479,7 @@ def advice(equity, price, rvol=None, trend_long=True, fee=None):
             "notional":notional,"qty":notional/price,"feasible":fail is None,"fail":fail,
             "reason":reason,"sharpe":sh,"drawdown":dd,"next":nxt,"gap":gap,
             "need_equity":MIN_NOTIONAL/position if position else float("inf"),
-            "worst":equity*(1+dd),"lev_plan":leverage_plan(equity,position,notional)}
+            "worst":equity*(1+dd) if dd is not None else None,"lev_plan":leverage_plan(equity,position,notional)}
     except (ValueError,TypeError,OverflowError):
         return {"method":"—","target_vol":TARGET_VOL_OVERRIDE,"position":0.0,"notional":0.0,
             "qty":0.0,"feasible":False,"fail":"bad_input","reason":"invalid_data","lev_plan":None}
@@ -497,6 +517,7 @@ def validate_decision_freshness(bar_ms, reference_ms, decision_ms):
 def run(a):
     from binance_api import BN
     bn = BN()
+    account_scope = hashlib.sha256(bn.key.encode()).hexdigest()[:24] if getattr(bn,"key",None) else ""
     # ⚠️ 2026-10-08 P0a：先加载交易所规则（MIN_NOTIONAL/stepSize 动态化）
     _rules_src = load_exchange_rules(bn)
     L = []
@@ -508,7 +529,7 @@ def run(a):
     if not st["ok"]:
         return f"⛔ 行情刷新失败，暂停建议：{st['err']}", None
     validate_bars(bars)
-    validate_bars(bars[-max(MA_WINDOW,VOL_WINDOW+1):],continuous=True)
+    validate_bars(bars[-max(SIGNAL_LOOKBACK,VOL_WINDOW+1):],continuous=True)
     if bars[-1]["t"] != (server_ms//86400000-1)*86400000:
         return "⛔ 缺少最近已完成 UTC 日线，暂停建议", None
     # ⚠️ 数据连续性检查（2026-10-07 加）——
@@ -522,14 +543,14 @@ def run(a):
     sig = signal_of(bars)
     if sig is None:
         A("=" * 78)
-        A(f"  {SYM} MA{MA_WINDOW} 趋势信号  "
+        A(f"  {SYM} {strategy_label()}：MA35入／MA40出＋量10＋VWMA10  "
           f"[V2: {VOL_WINDOW}日波动"
           + (f" + {TARGET_VOL_OVERRIDE*100:g}%档" if TARGET_VOL_OVERRIDE else "")
           + "]")
         A("=" * 78)
         A("")
         A(f"  ⛔ 数据不足，无法出信号")
-        A(f"     缓存 {len(bars)} 根，MA{MA_WINDOW} 至少需要 {MA_WINDOW} 根")
+        A(f"     缓存 {len(bars)} 根，B信号至少需要 {SIGNAL_LOOKBACK} 根")
         A(f"     （{note}）")
         return "\n".join(L), None
     try:
@@ -546,7 +567,7 @@ def run(a):
     if price<=0: raise DataError("实时价格必须为正")
 
     A("=" * 78)
-    A(f"  {SYM} MA{MA_WINDOW} 趋势信号  "
+    A(f"  {SYM} {strategy_label()}：MA35入／MA40出＋量10＋VWMA10  "
       f"[V2: {VOL_WINDOW}日波动"
       + (f" + {TARGET_VOL_OVERRIDE*100:g}%档" if TARGET_VOL_OVERRIDE else "")
       + f"]    {now:%Y-%m-%d %H:%M:%S}")
@@ -575,10 +596,15 @@ def run(a):
         A(f"  [数据] ✅ {gapnote}")
     _last_d = dt.datetime.fromtimestamp(bars[-1]["t"] / 1000, dt.UTC)
     if fixed:
+        completed_times = {b["t"] for b in bars}
         for t, c0, c1 in fixed:
             d = dt.datetime.fromtimestamp(t / 1000, dt.UTC)
-            A(f"  [K线修正] {d:%Y-%m-%d} 收盘 {c0:,.2f} → {c1:,.2f}"
-              f"（{(c1/c0-1)*100:+.2f}%）")
+            if t in completed_times:
+                A(f"  [K线修正] {d:%Y-%m-%d} UTC 收盘 {c0:,.2f} → {c1:,.2f}"
+                  f"（{(c1/c0-1)*100:+.2f}%）")
+            else:
+                A(f"  [未完成K线更新] {d:%Y-%m-%d} UTC 最新价 {c0:,.2f} → {c1:,.2f}"
+                  "；只更新缓存，不参与策略信号")
     elif st["ok"]:
         # ⚠️ 这里必须把「最后一根是哪天」写出来。
         #    上一版只写「无需修正」，读起来像「一切正常」——
@@ -602,10 +628,16 @@ def run(a):
 
     # ── 信号 ──
     A("  信号")
-    A(f"  决策日 {bd:%Y-%m-%d} UTC  收盘 {sig['close']:,.2f}  MA50 {sig['ma50']:,.2f}")
-    A(f"  趋势：{'高于' if sig['trend_long'] else '不高于'} MA50；10 日年化波动 {sig['rvol']*100:.1f}%")
-    A(f"  有效信号：{'做多' if sig['long'] else '空仓'}")
-    if sig["reason"]=="vol_cap": A("  波动率超过 120% 上限，主动空仓；这不是数据错误")
+    A(f"  决策日 {bd:%Y-%m-%d} UTC  收盘 {sig['close']:,.2f}  MA35 {sig['ma35']:,.2f}  MA40 {sig['ma40']:,.2f}")
+    A(f"  量10比值 {sig['volume_ratio10']:.4f}（当日ETH量÷此前10日均量）；VWMA10 {sig['vwma10']:,.2f}")
+    A(f"  空仓入场条件：{'通过' if sig['entry_eligible'] else '不通过'}；已有多仓持有条件：{'通过' if sig['holding_eligible'] else '不通过'}")
+    A(f"  10日年化波动 {sig['rvol']*100:.1f}%；有效信号须读取实际持仓后确定")
+    if RISK_OVERLAY == "c25":
+        ratio = f"{sig['c25_ratio']:.4f}" if sig['c25_ratio'] is not None else "未定义（30日波动为0）"
+        A(f"  C25：收盘低于3日前={sig['c25_down3']}；SD5/30={ratio}；当前触发={sig['c25_trigger']}；上一根触发={sig['c25_previous_trigger']}")
+        A(f"  最近两根完成日线{'有' if sig['c25_active'] else '无'}触发；预算保留{sig['c25_factor']:.0%}，有效目标波动 {TARGET_VOL_OVERRIDE*sig['c25_factor']:.1%}")
+        A("  C25不覆盖趋势/120%退出；恢复预算仍受5%门限、余额及交易规则约束，不构成盘中保护")
+    if sig['rvol']>VOL_CAP: A("  波动率超过120%上限，两种持仓状态均目标空仓")
     A(f"  实时价 {price:,.2f}")
     A("")
 
@@ -628,6 +660,7 @@ def run(a):
     plan = OrderPlan("hold","未读取账户")
     account_checked = False
     decision_ms = None
+    execution_guard = ""
     if a.check or a.archive:
         plan = OrderPlan("blocked","账户或持仓尚未验证")
         try:
@@ -644,21 +677,36 @@ def run(a):
             if not isinstance(mode.get("dualSidePosition"),bool): raise DataError("账户持仓模式未知")
             state = parse_positions(bn.positions(SYM),mode["dualSidePosition"])
             held = state.long_qty
+            sig = signal_of(bars, held)
             commission = bn.fapi("/fapi/v1/commissionRate",{"symbol":SYM},signed=True)
             fee = finite(commission["takerCommissionRate"],"市价手续费",0)
             if commission.get("symbol")!=SYM: raise DataError("手续费标的错误")
-            adv = advice(eq,price,rvol,trend_long=sig["trend_long"],fee=fee)
+            adv = advice(eq,price,rvol,trend_long=sig["trend_long"],fee=fee,
+                         budget_factor=sig.get('c25_factor',1.))
+            adv["reason"] = sig["reason"]
             tgt_pos = adv["position"]
             if adv.get("fail")=="bad_input": raise DataError("仓位输入无效")
             pending = validate_pending_orders(bn)
+            plan = plan_order(eq,price,tgt_pos,state,current_rules(),available,fee)
+            prior_decisions = []
+            if held == 0 and plan.actionable and plan.side == "BUY":
+                from execution_ledger import load_decisions
+                prior_decisions = load_decisions(ARCHIVE.with_name("ma50_decisions.json"))
             decision_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
             validate_decision_freshness(sig["bar_t"],reference_price_ms,decision_ms)
-            plan = plan_order(eq,price,tgt_pos,state,current_rules(),available,fee)
+            if held == 0 and plan.actionable and plan.side == "BUY":
+                from execution_ledger import has_exit_on_bar
+                # Switching between B and C25 cannot bypass a same-bar exit.
+                if any(has_exit_on_bar(prior_decisions,account_scope,sig['bar_t'],decision_ms,sid)
+                       for sid in (strategy.STRATEGY_ID,strategy.C25_STRATEGY_ID)):
+                    execution_guard = "same_bar_exit"
+                    plan = OrderPlan("blocked","本根日线已有B/B＋C25平仓建议且当前已空仓；不重新入场，等待下一根完成日线",target_qty=plan.target_qty)
             account_checked = True
             A("  账户与调仓")
             A("  ETHUSDT 未成交委托：普通0、条件0（已查询两个接口）")
             A(f"  权益 {eq:.4f} USDT；可用保证金 {available:.4f} USDT")
             A(f"  {'双向' if state.hedge else '单向'}模式；多仓 {held:.3f} ETH；空仓 {state.short_qty:.3f} ETH")
+            A(f"  本次采用{'持仓MA40离场' if held>0 else '空仓三条件入场'}规则；有效信号：{'做多' if sig['long'] else '空仓'}；原因 {sig['reason']}")
             A(f"  目标仓位 {tgt_pos:.4f}x；目标持仓 {format_qty(plan.target_qty)} ETH")
             A(f"  普通双向调仓门限 {strategy.SOFT_REBALANCE:.0%} 权益 = {eq*strategy.SOFT_REBALANCE:.4f} USDT（取整后的本次交易名义）")
             A(f"  ETHUSDT 最小名义 {MIN_NOTIONAL:g}U；数量步长 {STEP_SIZE:g}；市价数量上限 {MARKET_MAX_QTY:g}")
@@ -682,6 +730,7 @@ def run(a):
             A("  波动率上限不能保证避免突发暴跌或未来强平；低波动下任何档位均可能接近 3x")
         except Exception as error:
             plan = OrderPlan("blocked",f"账户依赖失败：{type(error).__name__}: {error}")
+            sig = signal_of(bars)  # Failed account checks cannot certify a position branch.
             A(f"  ⛔ 暂停建议：{plan.reason}")
         A("")
 
@@ -698,19 +747,35 @@ def run(a):
         decision_ms = int(bn.fapi("/fapi/v1/time",signed=False)["serverTime"])
     if not (a.check or a.archive):
         validate_decision_freshness(sig["bar_t"],reference_price_ms,decision_ms)
-    rule_config = dict(ma=MA_WINDOW,vol=VOL_WINDOW,target_vol=adv.get("target_vol"),
+    rule_config = dict(strategy_id=strategy_id(),entry_ma=strategy.ENTRY_MA_WINDOW,
+                       exit_ma=strategy.EXIT_MA_WINDOW,volume_window=strategy.VOLUME_WINDOW,
+                       volume_min=1,volume_baseline="previous_completed_bars_excluding_signal_bar",
+                       vwma_window=strategy.VWMA_WINDOW,vwma_includes_signal_bar=True,
+                       reentry_policy="verified_flat_and_prior_B_or_C25_exit_wait_next_bar",
+                       vol=VOL_WINDOW,target_vol=TARGET_VOL_OVERRIDE,
                        vol_cap=strategy.VOL_CAP,leverage=strategy.MAX_LEVERAGE,
                        rebalance_pct=strategy.SOFT_REBALANCE,rules=asdict(current_rules()))
+    rule_config.update(risk_overlay=RISK_OVERLAY,
+                       c25=strategy.C25_CONFIG if RISK_OVERLAY == "c25" else None,
+                       c25_return="simple_close_to_close_sample_ddof1",
+                       c25_memory="any_latest_two_completed_bar_triggers_before_cap")
     rule_version = hashlib.sha256(pathlib.Path(strategy.__file__).read_bytes() +
                                   json.dumps(rule_config,sort_keys=True).encode()).hexdigest()
     rec = {
         "decision_id":uuid.uuid4().hex,"decision_ms":str(decision_ms),
         "decision_at":dt.datetime.fromtimestamp(decision_ms/1000,dt.UTC).isoformat(),
-        "account_scope":hashlib.sha256(bn.key.encode()).hexdigest()[:24] if getattr(bn,"key",None) else "",
+        "account_scope":account_scope,"execution_guard":execution_guard,
         "reference_price":str(price),"reference_price_ms":str(reference_price_ms),"rule_version":rule_version,
         "symbol":SYM,"date":bd.strftime("%Y-%m-%d"),"bar_ms":str(sig["bar_t"]),
-        "bar_close":f"{sig['close']:.2f}","ma50":f"{sig['ma50']:.2f}","dist_ma50_pct":f"{sig['dist_pct']:.2f}",
-        "signal":"做多" if sig["long"] else "空仓","trend_signal":"做多" if sig["trend_long"] else "空仓",
+        "bar_close":f"{sig['close']:.2f}","ma50":f"{sig['ma50']:.2f}" if sig['ma50'] is not None else "",
+        "dist_ma50_pct":f"{sig['dist_pct']:.2f}" if sig['dist_pct'] is not None else "",
+        "strategy_id":strategy_id(),"signal_branch":sig['signal_branch'],
+        "risk_overlay":RISK_OVERLAY,"base_target_vol":str(TARGET_VOL_OVERRIDE),
+        "risk_budget_factor":str(sig.get('c25_factor',1.)),
+        **{k:str(v) if v is not None else '' for k,v in sig.items() if k.startswith('c25_')},
+        **{k:str(sig[k]) for k in ('ma35','ma40','vwma10','volume','volume_mean10','volume_ratio10','entry_eligible','holding_eligible')},
+        "signal":"未核验持仓" if sig['long'] is None else ("做多" if sig["long"] else "空仓"),
+        "trend_signal":"未核验持仓" if sig['trend_long'] is None else ("做多" if sig["trend_long"] else "空仓"),
         "decision_reason":sig["reason"],"action":plan.action if account_checked else "未验证",
         "side":plan.side,"position_side":plan.position_side,"reduce_only":str(plan.reduce_only),
         "order_qty":f"{format_qty(plan.quantity)}" if plan.actionable else "",
@@ -837,15 +902,18 @@ def history():
     rows=load_archive()
     if not rows: print("还没有归档。");return
     days=sorted({r["date"] for r in rows});legacy=sum(r.get("validation_status") in (None,"","legacy_unverified") for r in rows)
-    print(f"MA50 归档：{len(days)} 天；旧版未验证记录 {legacy} 条")
+    b_count=sum(r.get('strategy_id')==strategy.STRATEGY_ID for r in rows)
+    c_count=sum(r.get('strategy_id')==strategy.C25_STRATEGY_ID for r in rows)
+    print(f"日线归档：{len(days)} 天；B方案 {b_count} 条；B＋C25 {c_count} 条；其他/旧方案 {len(rows)-b_count-c_count} 条；旧版未验证 {legacy} 条")
     if len(days)>1:
         first=dt.date.fromisoformat(days[0]);last=dt.date.fromisoformat(days[-1])
         missing={str(first+dt.timedelta(days=i)) for i in range((last-first).days+1)}-set(days)
         if missing:print(f"缺少 {len(missing)} 天：{', '.join(sorted(missing)[:8])}")
-    print("日期         有效信号  动作    ETH后10天价格涨跌  状态")
+    print("日期         方案  有效信号  动作    ETH后10天价格涨跌  状态")
     for row in rows[-25:]:
         value=row.get("price_return_10d") or row.get("fwd_10d") or "—"
-        print(f"{row['date']}  {row.get('signal','—')}  {row.get('action','—')}  {value}  {row.get('validation_status','旧版未验证')}")
+        label={strategy.STRATEGY_ID:'B',strategy.C25_STRATEGY_ID:'B＋C25'}.get(row.get('strategy_id'),'其他/旧方案')
+        print(f"{row['date']}  {label}  {row.get('signal','—')}  {row.get('action','—')}  {value}  {row.get('validation_status','旧版未验证')}")
     print("价格涨跌未含变仓、手续费或资金费；记录天数不能直接证明策略有效。")
 
 
@@ -877,6 +945,8 @@ def sync_methods():
 
 
 def selfcheck():
+    if RISK_OVERLAY == "c25":
+        return selfcheck_c25()
     from align import panel,sharpe,max_dd
     errors=[]
     try:
@@ -892,7 +962,6 @@ def selfcheck():
             if abs(sharpe(x)-expected_sh)>.003 or abs(max_dd(x)-expected_dd)>.005:
                 errors.append(f"{name} 历史表超出容差")
             if abs(actual_need-need)>.15:errors.append(f"{name} 统计分位门槛错误")
-            if np.any((w>0)&(~P.sig[W-1:-1].astype(bool))):errors.append(f"{name} 趋势空仓仍有目标")
             if np.any((w>0)&(P.vol[W:]>VOL_CAP)):errors.append(f"{name} 波动上限未生效")
         for lev,expected_dd in DD_BY_LEV:
             if abs(max_dd(P.net(None,lev=lev)[W:])-expected_dd)>.005:errors.append(f"{lev}x 回撤表错误")
@@ -908,21 +977,60 @@ def selfcheck():
     return not errors
 
 
+def selfcheck_c25():
+    """Independent closed-bar formulas and quantity budgets, never B statistics."""
+    errors=[];checks=0
+    try:
+        raw,_=complete_bars(load_cache());validate_bars(raw,continuous=True)
+        if len(raw)<SIGNAL_LOOKBACK+1:raise DataError("C25自检至少需要41根完成日线")
+        funding=load_funding()
+        strategy.validate_funding(funding,raw[SIGNAL_LOOKBACK]['t'],raw[-1]['t']+86400000)
+        if any(r.get("markPriceApproximate") for r in funding):print("⚠️ 部分早期资金费标记价使用 API 8h 开盘近似")
+        closes=np.array([b['c'] for b in raw]);ret=np.r_[np.nan,closes[1:]/closes[:-1]-1]
+        for i in range(SIGNAL_LOOKBACK,len(raw)):
+            active=any(closes[j]<closes[j-3] and
+                       np.std(ret[j-4:j+1],ddof=1)>1.25*np.std(ret[j-29:j+1],ddof=1)
+                       for j in (i,i-1))
+            rv=float(np.std(ret[i-9:i+1],ddof=1)*np.sqrt(365))
+            for held in (0.,.1):
+                sig=signal_of(raw[:i+1],held)
+                if sig['c25_active']!=active:raise DataError("C25闭合日线触发/记忆与独立公式不一致")
+                if abs(sig['rvol']-rv)>1e-12:raise DataError("C25的10日波动口径不一致")
+                price=raw[i]['c'];adv=advice(1000,price,rv,sig['long'],budget_factor=sig['c25_factor'])
+                expected=min(.6*(.25 if active else 1)/rv,max_position()) if sig['long'] else 0.
+                if abs(adv['position']-expected)>1e-11:raise DataError("C25预算未在仓位上限之前应用")
+                plan=plan_order(1000,price,adv['position'],PositionState(long_qty=held),current_rules(),1000)
+                if plan.actionable and plan.side=='BUY' and plan.required_funds>1000+1e-9:raise DataError("C25数量超过保证金预算")
+                checks+=1
+    except Exception as error:errors.append(f"{type(error).__name__}: {error}")
+    for error in errors:print(f"❌ {error}")
+    if errors:print("C25自检失败；不会按成功状态退出。")
+    else:print(f"✅ B＋C25自检通过：{checks}次闭合日线预算/数量检查；不采用B历史绩效表，不验证当前账户或未来强平")
+    return not errors
+
+
 def main():
     # Windows redirected consoles may default to GBK, which cannot encode status symbols.
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
-    ap=argparse.ArgumentParser(description="ETHUSDT MA50 手动交易辅助；只读交易所")
+    ap=argparse.ArgumentParser(description="ETHUSDT默认B＋C25：MA35入／MA40出＋量10＋VWMA10；手动交易辅助，只读交易所")
     for flag in ("console","check","archive","history","backfill","selfcheck","rebuild","sync-methods"):
         ap.add_argument("--"+flag,action="store_true")
-    ap.add_argument("--daily",action="store_true",help="统一日检：DD采样及成交同步、MA50检查归档、同日核对与操作摘要")
-    ap.add_argument("--target-vol",type=float,default=None,help="目标波动率 5~60%%，默认 60")
+    ap.add_argument("--daily",action="store_true",help="统一日检：DD采样及成交同步、默认B＋C25检查归档、同日核对与操作摘要")
+    ap.add_argument("--target-vol",type=float,default=None,help="仅原B模式可调整5~60%%，须显式--risk-overlay none；C25固定基础60%%")
+    ap.add_argument("--risk-overlay",choices=("none","c25"),default=DEFAULT_RISK_OVERLAY,
+                    help="默认c25：跌3日且SD5/30>1.25时留25%%预算，记最近2根完成日线；none显式选择原B")
     ap.add_argument("--offline",action="store_true",help="仅用于 history/selfcheck/sync-methods，使用已验证缓存")
     a=ap.parse_args()
     if a.daily and any((a.history,a.backfill,a.selfcheck,a.rebuild,a.sync_methods,a.offline)):
         ap.error("--daily不能与历史、回填、自检、重建、统计同步或离线模式合用")
-    global TARGET_VOL_OVERRIDE,TARGET_VOL_EXPLICIT
+    global TARGET_VOL_OVERRIDE,TARGET_VOL_EXPLICIT,RISK_OVERLAY
+    if a.risk_overlay == "c25" and a.sync_methods:
+        ap.error("sync-methods仅更新原B绩效表；须显式--risk-overlay none，不适用于C25")
+    if a.risk_overlay == "c25" and a.target_vol is not None:
+        ap.error("已研究的C25固定基础预算60%；不能同时覆盖target-vol")
+    RISK_OVERLAY=a.risk_overlay
     value=DEFAULT_TARGET_VOL if a.target_vol is None else (a.target_vol/100 if a.target_vol>1 else a.target_vol)
     if not np.isfinite(value) or not .05<=value<=.60:ap.error("目标波动率必须在 5%~60%")
     TARGET_VOL_OVERRIDE=value;TARGET_VOL_EXPLICIT=a.target_vol is not None

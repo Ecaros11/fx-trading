@@ -150,7 +150,8 @@ class Isolated(unittest.TestCase):
         self.stack=contextlib.ExitStack()
         for name,relative in [('ROOT','root'),('CACHE','candles.json'),('FUND','funding.json'),('ARCHIVE','history.csv'),('_RULES_CACHE','rules.json')]:
             self.stack.enter_context(patch.object(m,name,self.directory/relative))
-        for name,value in [('MIN_NOTIONAL',20.0),('STEP_SIZE',.001),('MIN_QTY',.001),('MARKET_MAX_QTY',2000.0),('TARGET_VOL_OVERRIDE',.6)]:
+        # Legacy B regressions select B explicitly; C25 subclasses exercise the default.
+        for name,value in [('MIN_NOTIONAL',20.0),('STEP_SIZE',.001),('MIN_QTY',.001),('MARKET_MAX_QTY',2000.0),('TARGET_VOL_OVERRIDE',.6),('RISK_OVERLAY',getattr(self,'risk_overlay','none'))]:
             self.stack.enter_context(patch.object(m,name,value))
         m.CACHE.write_text(json.dumps(self.data));m.FUND.write_text(json.dumps(self.funds))
         self.write_rules()
@@ -278,6 +279,7 @@ class FlowTests(Isolated):
         now=self.now
         clock_values=iter(times) if times is not None else None
         class FakeBN:
+            key='offline-test-key'
             def __init__(self):pass
             def fapi(self,path,params=None,signed=True):
                 if 'exchangeInfo' in path:return {'symbols':[symbol('BTCUSDT',50,120),symbol()]}
@@ -388,10 +390,14 @@ class LedgerTests(Isolated):
         with self.assertRaises(ValueError):simulate(self.data,events)
     def test_future_data_does_not_change_past(self):
         short=simulate(self.data[:70],self.funds);full=simulate(self.data,self.funds)
-        np.testing.assert_allclose(short['net'],full['net'][:70],rtol=0,atol=1e-12)
+        self.assertTrue(np.allclose(short['net'],full['net'][:70],rtol=0,atol=1e-12))
     def test_weight_uses_previous_close(self):
-        P=panel([b['c'] for b in self.data],[0]*len(self.data));w=P.weight(.6)
-        self.assertTrue(np.all(w[~np.r_[False,P.sig[:-1].astype(bool)]]==0))
+        P=panel([b['c'] for b in self.data],[0]*len(self.data),bars=self.data);w=P.weight(.6)
+        expected=simulate(self.data,P.funding,.6,1,P.fee,funding_interval_hours=None)
+        self.assertTrue(np.array_equal(w,expected['target']))
+        changed=copy.deepcopy(self.data);changed[-1]['c']*=2
+        late=panel([b['c'] for b in changed],[0]*len(changed),bars=changed)
+        self.assertTrue(np.array_equal(w,late.weight(.6)))
     def test_initial_peak_in_drawdown(self):self.assertAlmostEqual(max_dd([-.1]),-.1)
     def test_dynamic_uses_same_simulator(self):
         result=m.dynamic_drawdown(self.data,m.funding_by_day(),90)
@@ -403,12 +409,12 @@ class LedgerTests(Isolated):
         cash=np.zeros(len(self.data));cash[60]=100;cash[70]=50
         r=simulate(self.data,self.funds,initial_equity=0,contributions=cash,fixed_lev=0)
         self.assertEqual(r['equity'][69],100);self.assertEqual(r['equity'][70],150)
-        np.testing.assert_array_equal(r['net'],np.zeros(len(self.data)))
+        self.assertTrue(np.array_equal(r['net'],np.zeros(len(self.data))))
     def test_dca_first_deposit_equals_initial_capital(self):
         cash=np.zeros(len(self.data));cash[60]=100
         a=simulate(self.data,self.funds,initial_equity=0,contributions=cash,constrained=True,price_buffer=.001)
         b=simulate(self.data,self.funds,initial_equity=100,constrained=True,price_buffer=.001)
-        np.testing.assert_allclose(a['equity'][60:],b['equity'][60:]);np.testing.assert_array_equal(a['net'],b['net'])
+        self.assertTrue(np.allclose(a['equity'][60:],b['equity'][60:],rtol=1e-7,atol=0));self.assertTrue(np.array_equal(a['net'],b['net']))
     def test_dca_midnight_funding_still_uses_old_quantity(self):
         cash=np.zeros(len(self.data));cash[60]=100;cash[70]=50
         events=copy.deepcopy(self.funds)
@@ -424,7 +430,7 @@ class LedgerTests(Isolated):
         for e in events:
             if e['t']%DAY==0:e['t']+=47
         a=simulate(self.data,self.funds);b=simulate(self.data,events)
-        np.testing.assert_array_equal(a['funding_cost'],b['funding_cost'])
+        self.assertTrue(np.array_equal(a['funding_cost'],b['funding_cost']))
     def test_invalid_funding_mark_fails_even_if_no_position(self):
         for value in (-1,0,float('nan'),float('inf')):
             with self.subTest(value=value):
@@ -450,7 +456,7 @@ class LedgerTests(Isolated):
 
     def test_explicit_default_vol_window_matches_default(self):
         a=simulate(self.data,self.funds);b=simulate(self.data,self.funds,vol_window=10)
-        np.testing.assert_array_equal(a['net'],b['net'])
+        self.assertTrue(np.array_equal(a['net'],b['net']))
     def test_twenty_day_vol_uses_exact_prior_returns(self):
         r=simulate(self.data,self.funds,vol_window=20,initial_equity=100,target_vol=.15)
         i=60;closes=np.array([b['c'] for b in self.data]);ret=np.r_[0,np.diff(closes)/closes[:-1]]
@@ -458,7 +464,7 @@ class LedgerTests(Isolated):
         self.assertAlmostEqual(r['target'][i],expected)
     def test_twenty_day_window_prefix_causality(self):
         a=simulate(self.data[:70],self.funds,vol_window=20);b=simulate(self.data,self.funds,vol_window=20)
-        np.testing.assert_allclose(a['net'],b['net'][:70],rtol=0,atol=1e-12)
+        self.assertTrue(np.allclose(a['net'],b['net'][:70],rtol=0,atol=1e-12))
     def test_bad_vol_window_rejected(self):
         for window in (0,1,20.5,True,60):
             with self.assertRaises(ValueError):simulate(self.data,self.funds,vol_window=window)
@@ -470,7 +476,7 @@ class LedgerTests(Isolated):
             data[i]['c']=2600-20*(i-68);data[i]['o']=data[i-1]['c'];data[i]['h']=max(data[i]['o'],data[i]['c'])+30;data[i]['l']=min(data[i]['o'],data[i]['c'])-30
         r=simulate(data,self.funds,initial_equity=100,constrained=True)
         self.assertTrue(np.any(r['target'][60:]==0))
-        np.testing.assert_array_equal(r['quantity'][r['target']==0],np.zeros(np.count_nonzero(r['target']==0)))
+        self.assertTrue(np.array_equal(r['quantity'][r['target']==0],np.zeros(np.count_nonzero(r['target']==0))))
 
 
 class StorageTests(Isolated):

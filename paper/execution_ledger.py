@@ -312,6 +312,30 @@ def append_decision(path, record):
         rows.sort(key=lambda x:(int(x['decision_ms']),x['decision_id']))
         atomic_write(path,json.dumps({'schema_version':1,'records':rows},ensure_ascii=False,indent=2))
 
+def has_exit_on_bar(decisions, scope, bar_ms, now_ms, strategy_id):
+    """A prior exit plus verified flat state blocks reentry, without claiming fills."""
+    if not scope:
+        raise DataError('账户归属未知，不能核验同根日线入场历史')
+    now_ms = timestamp(now_ms); bar_ms = timestamp(bar_ms)
+    found = False
+    for row in decisions:
+        if (row.get('account_scope') != scope or row.get('symbol') != SYMBOL or
+                row.get('strategy_id') != strategy_id):
+            continue
+        stamp = timestamp(row['decision_ms'])
+        if stamp > now_ms:
+            raise DataError('本账户B建议时刻晚于服务器，暂停入场并核查记录')
+        if stamp // DAY != now_ms // DAY:
+            continue
+        if timestamp(row['bar_ms']) != bar_ms:
+            continue
+        if row.get('validation_status') == 'order' and row.get('side') == 'SELL':
+            target = Decimal(amount(row['target_qty'], '历史目标多仓', 0))
+            if target == 0:
+                found = True
+    return found
+
+
 def candidate(fill, decisions, scope):
     # Informational time/side candidate, never proof that a manual order followed advice.
     prior=[d for d in decisions if d.get('account_scope')==scope and d.get('symbol')==SYMBOL

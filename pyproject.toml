@@ -1,7 +1,7 @@
 [project]
 name = "fx-trading"
 version = "0.1.0"
-description = "ETHUSDT MA50 signal and account drawdown tools"
+description = "ETHUSDT B daily strategy and account drawdown tools"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

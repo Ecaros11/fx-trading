@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import uuid
 
 from dd_support import DAY, file_lock
-from execution_ledger import load_decisions, ranges
+from execution_ledger import load_decisions, ranges, has_exit_on_bar
 
 BEIJING = dt.timezone(dt.timedelta(hours=8))
 MAX_LEDGER_AGE_MS = 15 * 60 * 1000
@@ -36,7 +36,8 @@ def execution_check(rec, decisions, book, sync_ok):
     result = dict(session_start_ms=start, prior_runs=len(prior), last_decision_id=last["decision_id"] if last else None,
                   fills=0, orders=0, buy_qty="0", sell_qty="0", cutoff_ms=None,
                   coverage_complete=False, evidence_ok=False, match="暂无本轮早先建议可核对",
-                  changes=[], warnings=[], attribution="仅数量/方向候选，未确认策略归属")
+                  changes=[], warnings=[], rule_changed=False, same_bar_exit=False,
+                  attribution="仅数量/方向候选，未确认策略归属")
     if future:
         result["warnings"].append("本地建议时刻晚于当前服务器，需核查时钟或记录")
     if last:
@@ -48,7 +49,16 @@ def execution_check(rec, decisions, book, sync_ok):
             if old not in (None, "") and new not in (None, "") and dec(old) != dec(new):
                 result["changes"].append(f"{title} {old} → {new}")
         if last.get("rule_version") != rec.get("rule_version"):
+            result['rule_changed'] = True
             result["changes"].append("规则版本或参数发生变化，不能直接按旧建议核对")
+    # Flat state and a prior B exit are sufficient to wait; fills may be
+    # outside the ledger cutoff. Missing sync must not erase this guard.
+    if rec.get('signal_branch') == 'entry' and rec.get('strategy_id') and scope:
+        from ma50_core import STRATEGY_ID, C25_STRATEGY_ID
+        ids=(STRATEGY_ID,C25_STRATEGY_ID) if rec['strategy_id'] in (STRATEGY_ID,C25_STRATEGY_ID) else (rec['strategy_id'],)
+        result['same_bar_exit'] = any(has_exit_on_bar(prior,scope,rec['bar_ms'],now,sid) for sid in ids)
+        if result['same_bar_exit']:
+            result['warnings'].append('当前空仓且同一根日线已有B/B＋C25平仓建议；成交归属仍需核验，等待下一根完成日线再判断入场')
     if not book or not scope or book.get("account_scope") != scope:
         result["warnings"].append("成交账本缺失或账户归属不匹配，同日执行未核实")
         return result
@@ -73,7 +83,9 @@ def execution_check(rec, decisions, book, sync_ok):
         result["warnings"].append("成交查询截止时刻已超过15分钟或早于本轮，需重新同步")
     if last:
         after = [f for f in fills if f["time"] >= int(last["decision_ms"])]
-        if cutoff < int(last["decision_ms"]):
+        if result['rule_changed']:
+            result['match'] = "规则版本已变化，旧建议后的成交不能作为本次B方案执行依据"
+        elif cutoff < int(last["decision_ms"]):
             result["match"] = "账本尚未覆盖上次建议之后，执行情况未知"
         elif not after:
             result["match"] = "已覆盖区间未见上次建议后的成交" if result["evidence_ok"] else "上次建议后的成交未核实"
@@ -95,18 +107,23 @@ def execution_check(rec, decisions, book, sync_ok):
 
 def operation_summary(rec, check, dd_result, dd_ok):
     if rec is None:
-        return "每日检查：MA50未能生成有效建议；查看下方失败原因并重新运行。", "failed"
+        return "每日检查：日线策略未能生成有效建议；查看下方失败原因并重新运行。", "failed"
     valid = rec.get("validation_status")
     now = int(rec["decision_ms"])
     lines = [f"每日操作摘要  {local_time(now)} 北京时间",
              f"本轮日线执行日：{local_time(check['session_start_ms'])} 起（至次日08:00）"]
+    if rec.get('strategy_id'):
+        name="B＋C25" if rec.get('risk_overlay') == 'c25' else "B"
+        lines.append(f"策略{name}：MA35入／MA40出＋量10＋VWMA10；本次分支：" +
+                     {"entry":"空仓入场","holding":"持仓离场","unknown":"持仓未核验"}.get(rec.get('signal_branch'),"未知"))
     holding = rec.get("held_qty_at_signal")
     qty = rec.get("order_qty", "")
     side = rec.get("side")
     urgent = (valid == "order" and side == "SELL" and
               (dec(rec["target_qty"]) == 0 or
                dec(holding) * dec(rec["reference_price"]) > 3 * dec(rec["equity_at_signal"])))
-    review = not check["evidence_ok"] or (valid == "order" and check["fills"] > 0 and not urgent)
+    review = not check["evidence_ok"] or check.get('same_bar_exit',False) or (valid == "order" and
+             (check["fills"] > 0 or check.get('rule_changed')) and not urgent)
     status = "blocked" if valid == "blocked" else ("review" if review else "ready")
     if valid == "blocked":
         lines.append("今日动作：暂停数量建议")
@@ -114,6 +131,8 @@ def operation_summary(rec, check, dd_result, dd_ok):
         verb = "买入加多" if side == "BUY" else ("卖出平多" if dec(rec["target_qty"]) == 0 else "卖出减多")
         if urgent:
             lines.append(f"今日动作：优先核对并{verb} {qty} ETH（退出/超仓减仓，不因同日记录延后）")
+        elif check.get('same_bar_exit'):
+            lines.append('今日动作：先核查本轮平仓执行；等待下一根完成日线，不按同一根信号重新入场')
         elif review:
             lines.append(f"今日动作：先复核同日执行；当前计算差额为{verb} {qty} ETH，勿直接重复旧单")
         else:
@@ -123,10 +142,20 @@ def operation_summary(rec, check, dd_result, dd_ok):
         lines.append(f"订单方向：{side}；持仓方向：{direction}；{constraint}")
     else:
         lines.append("今日动作：不用动（当前没有可执行调仓差额）")
-    reasons = {"trend_off": "完成日线不高于MA50，目标空仓", "vol_cap": "10日波动超过120%，目标空仓",
-               "in_market": "趋势和波动条件允许做多"}
+    reasons = {"trend_off": "旧方案趋势条件不通过", "vol_cap": "10日波动超过120%，目标空仓",
+               "exit_ma40":"已有多仓且收盘不高于MA40，目标平多",
+               "entry_ma35":"空仓且收盘不高于MA35，不入场",
+               "entry_volume":"空仓且当日量不足此前10日均量，不入场",
+               "entry_vwma":"空仓且收盘不高于VWMA10，不入场",
+               "position_unknown":"实际持仓未核验，不能确定入场或离场分支",
+               "in_market": "本次持仓分支和波动条件允许做多"}
     lines.append("原因：" + reasons.get(rec.get("decision_reason"), "参见完整检查") + "；" + rec.get("notes", ""))
     lines.append(f"信号日 {rec['date']} UTC；10日波动 {rec.get('realized_vol_pct','—')}%；目标名义/权益 {rec.get('target_position') or '—'}x")
+    if rec.get('risk_overlay') == 'c25':
+        effective=f"{dec(rec['target_vol']):.0%}" if rec.get('target_vol') else "未核验"
+        lines.append(f"C25：当前触发 {rec.get('c25_trigger')}；上一根触发 {rec.get('c25_previous_trigger')}；SD5/30 {rec.get('c25_ratio') or '未定义'}")
+        lines.append(f"基础目标波动60%；预算系数 {rec.get('risk_budget_factor')}；本次有效目标波动 {effective}，并非固定仓位比例")
+        lines.append("C只调整预算；退出优先。预算恢复仍由本次订单校验决定，不能保证盘中免于强平。")
     if holding not in (None, ""):
         after = dec(holding)
         if valid == "order":
@@ -162,7 +191,8 @@ def run_daily(args, live):
 def _run_daily(args, live, dd):
     dd_result = {}
     dd_text = io.StringIO()
-    print("每日检查正在进行：先采样与同步成交，再生成最新MA50建议。", flush=True)
+    label = live.strategy_label() if hasattr(live,"strategy_label") else "B"
+    print(f"每日检查正在进行：先采样与同步成交，再生成最新{label}策略建议。", flush=True)
     try:
         with contextlib.redirect_stdout(dd_text):
             dd_code = dd.main(["--snapshot"], result=dd_result)
@@ -173,7 +203,7 @@ def _run_daily(args, live, dd):
     try:
         full, rec = live.run(SimpleNamespace(check=True, archive=True))
     except Exception as error:
-        full, rec = f"MA50失败：{type(error).__name__}: {error}", None
+        full, rec = f"日线策略失败：{type(error).__name__}: {error}", None
     check = {}
     if rec:
         try:
@@ -216,8 +246,9 @@ def _run_daily(args, live, dd):
 
 def render_report(summary, full, dd_text, archive_text):
     fence = chr(96) * 3
+    strategy_name = "B＋C25" if "B＋C25" in full else "B"
     sections = (("每日操作摘要", summary),
-                ("MA50计算明细（同日复核提醒以顶部摘要为准）", full),
+                (f"{strategy_name}策略计算明细（同日复核提醒以顶部摘要为准）", full),
                 ("DD采样与成交明细", dd_text), ("建议归档", archive_text))
     return "\n\n".join(f"## {title}\n\n{fence}text\n{body.rstrip()}\n{fence}"
                         for title, body in sections if body.strip()) + "\n"

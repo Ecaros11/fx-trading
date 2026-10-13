@@ -1,12 +1,13 @@
-"""Cash-flow backtest using the same MA50 decisions and order constraints as live.
+"""Cash-flow backtest using the same B decisions and order constraints as live.
 
 The first funding settlement at a UTC daily boundary belongs to the position
 held before the daily rebalance. Trade price defaults to the daily open; this
 is a price approximation, not an intraday liquidation or real-fill simulator.
 """
 import numpy as np
-from ma50_core import (MA_WINDOW, VOL_WINDOW, VOL_CAP, TARGET_VOL, FEE, SOFT_REBALANCE,
-                       ExchangeRules, PositionState, plan_order, strategy_position, decimal, validate_funding)
+from ma50_core import (VOL_WINDOW, VOL_CAP, TARGET_VOL, FEE, SOFT_REBALANCE,
+                       ExchangeRules, PositionState, plan_order, strategy_position, decimal, validate_funding,
+                       SIGNAL_LOOKBACK, signal_indicators, signal_decision, STRATEGY_ID)
 
 DAY = 86_400_000
 PY = 365.0
@@ -76,7 +77,7 @@ def simulate(bars, funding, target_vol=TARGET_VOL, initial_equity=1000.0,
     n = len(bars)
     if n <= warmup or not np.isfinite([initial_equity, fee, slippage]).all() or initial_equity < 0 or fee < 0 or slippage < 0:
         raise ValueError("回测参数或样本长度无效")
-    if isinstance(vol_window, bool) or not isinstance(vol_window, (int, np.integer)) or vol_window < 2 or warmup < max(MA_WINDOW, vol_window + 1):
+    if isinstance(vol_window, bool) or not isinstance(vol_window, (int, np.integer)) or vol_window < 2 or warmup < max(SIGNAL_LOOKBACK, vol_window + 1):
         raise ValueError("波动窗口必须为至少2日的整数，预热期必须覆盖信号与波动窗口")
     cash = np.zeros(n) if contributions is None else np.asarray(contributions, dtype=float)
     if cash.shape != (n,) or not np.isfinite(cash).all() or np.any(cash < 0) or np.any(cash[:warmup] != 0):
@@ -90,7 +91,8 @@ def simulate(bars, funding, target_vol=TARGET_VOL, initial_equity=1000.0,
     times = np.array([int(b['t']) for b in bars])
     if any(isinstance(b["t"], bool) or float(b["t"]) != int(b["t"]) for b in bars) or np.any(times % DAY) or np.any(np.diff(times) != DAY):
         raise ValueError("回测日线不连续、有重复或倒序")
-    r = daily_ret(C); average = sma(C, MA_WINDOW)
+    r = daily_ret(C)
+    indicators = {i: signal_indicators(bars[max(0, i-SIGNAL_LOOKBACK):i]) for i in range(warmup, n)}
     vols = np.full(n, np.nan)
     for i in range(vol_window + 1, n):
         vols[i] = realized_vol(r, i, win=vol_window)
@@ -124,13 +126,14 @@ def simulate(bars, funding, target_vol=TARGET_VOL, initial_equity=1000.0,
             equity -= cost; funding_cost[i] += cost
         if equity <= 0:
             net[i] = -1; equities[i:] = 0; break
-        trend = bool(C[i-1] > average[i-1])
+        trend, signal_reason, branch = signal_decision(indicators[i], held, vols[i])
         if fixed_lev is None:
             weight, reason = strategy_position(trend, vols[i], equity, target_vol,
                                                fee + slippage, VOL_CAP, rules.min_notional)
         else:
             weight = min(fixed_lev, 3 / (1 + 3 * (fee + slippage))) if trend and vols[i] <= VOL_CAP else 0
             reason = "in_market" if weight else "off"
+        if not trend: reason = signal_reason
         targets[i] = weight
         available = max(0, equity - held * O[i] / 3)
         plan = plan_order(equity, O[i], weight, PositionState(long_qty=held), rules,
@@ -155,7 +158,8 @@ def simulate(bars, funding, target_vol=TARGET_VOL, initial_equity=1000.0,
             'fees':fees,'funding_cost':funding_cost,'actions':actions,
             'rebalance_policy':'symmetric' if rebalance_both else 'increase_only',
             'soft_rebalance_pct':soft_pct,'exchange_constraints':constrained,
-            'model':'daily_open_cashflow; midnight funding before rebalance; no liquidation model',
+            'strategy_id':STRATEGY_ID,
+            'model':'B daily_open_cashflow; midnight funding before rebalance; no liquidation model',
             'funding_price_approximation':any((not e.get('markPrice') or e.get('markPriceApproximate')) for e in funding if e['t']>=times[warmup])}
 
 
@@ -166,12 +170,14 @@ class panel:
         if len(self.C) != len(self.FR) or not np.isfinite(self.FR).all():
             raise ValueError("资金费和价格长度/数值不匹配")
         self.n = len(self.C); self.fee = fee
-        self.r = daily_ret(self.C); self.ma50 = sma(self.C, MA_WINDOW)
-        self.sig = (self.C > self.ma50).astype(float)
+        self.r = daily_ret(self.C)
         self.vol = np.full(self.n, np.nan)
         for i in range(VOL_WINDOW + 1,self.n):self.vol[i] = realized_vol(self.r,i)
-        self.bars = bars or [{'t':(10957+i)*DAY,'o':float(self.C[max(0,i-1)]),
-                             'c':float(c)} for i,c in enumerate(self.C)]
+        if bars is None:
+            raise ValueError("B策略必须提供真实成交量日线，不能仅凭价格伪造量能")
+        self.bars = bars
+        if len(bars) != self.n or not np.array_equal(self.C, [b['c'] for b in bars]):
+            raise ValueError("日线与收盘序列不一致")
         self._actual_funding = funding is not None
         self.funding = funding if funding is not None else [
             {'t':b['t']+8*3_600_000,'rate':float(self.FR[i]),'markPrice':float(b['o'])}
@@ -180,13 +186,11 @@ class panel:
     def weight(self,tv=None,lev=1.405,cap=None,vol_cap='auto',vol_lag=0,sig_lag=1):
         if vol_lag != 0 or sig_lag != 1:
             raise ValueError("只支持无前视、无额外滞后的权重")
-        result = np.zeros(self.n)
-        for i in range(VOL_WINDOW + 1,self.n):
-            if tv is None:
-                result[i] = lev if self.sig[i-1] and self.vol[i] <= VOL_CAP else 0
-            elif self.vol[i] > 0:
-                result[i] = strategy_position(bool(self.sig[i-1]),self.vol[i],1,tv,self.fee)[0]
-        if cap is not None:result = np.minimum(result,cap)
+        if vol_cap != 'auto' or cap is not None:
+            raise ValueError("B统计不支持额外仓位/波动上限覆盖")
+        result = simulate(self.bars,self.funding,tv,1,self.fee,warmup=60,
+                          fixed_lev=lev if tv is None else None,
+                          funding_interval_hours=8 if self._actual_funding else None)['target']
         return result
 
     def net(self,tv=None,lev=1.405,warmup=60,**kwargs):
@@ -196,18 +200,15 @@ class panel:
                         funding_interval_hours=8 if self._actual_funding else None)['net']
 
     def net_lookahead(self,tv=None,lev=1.405):
-        # Demonstration only; no use in validation or published statistics.
-        w = np.zeros(self.n)
-        for i in range(VOL_WINDOW + 1,self.n):
-            if self.vol[i] > 0:
-                w[i] = strategy_position(bool(self.sig[i]),self.vol[i],1,tv,self.fee)[0] if tv is not None else self.sig[i]*lev
-        return w*self.r-np.abs(np.diff(np.r_[0,w]))*self.fee-w*self.FR
+        raise ValueError("B策略禁止使用当日未完成数据的前视统计")
 
 
 def assert_no_lookahead(panel_obj,tv=None,lev=1.405,**kwargs):
     # Validate causality structurally instead of requiring a higher fake Sharpe.
-    weights = panel_obj.weight(tv,lev)
-    for i in range(60,len(weights)):
-        if not panel_obj.sig[i-1] and weights[i] != 0:
-            raise AssertionError("空仓信号对应非零仓位")
-    return sharpe(panel_obj.net(tv,lev)[60:]),sharpe(panel_obj.net_lookahead(tv,lev)[60:])
+    full = panel_obj.net(tv,lev)
+    if len(full) > 61:
+        cut = len(full)-1
+        prefix = panel(panel_obj.C[:cut],panel_obj.FR[:cut],panel_obj.fee,
+                       bars=panel_obj.bars[:cut],funding=panel_obj.funding)
+        np.testing.assert_array_equal(full[:cut],prefix.net(tv,lev))
+    return sharpe(full[60:]),sharpe(full[60:])
